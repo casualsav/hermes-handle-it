@@ -13,6 +13,9 @@ provides_tools:
   - support_chat_send
   - support_chat_wait
   - support_chat_end
+  - support_call_start
+  - support_call_wait
+  - support_call_end
 provides_hooks:
   - pre_tool_call
   - on_session_finalize
