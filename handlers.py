@@ -93,14 +93,15 @@ def _asker(parent_agent):
         return None
 
     def ask(question: str, choices: list) -> Optional[str]:
-        try:
-            from tools.clarify_tool import clarify_tool
-        except ImportError:  # outside a Hermes checkout (tests): same callback contract, no wrapper
+        if _ctx is None:  # not loaded by Hermes (tests): same callback contract, no clarify tool
             reply = callback([{"qid": "q0", "question": question, "choices": list(choices),
                                "choices_offered": list(choices), "multi_select": False}])
             answer = (reply.get("answers") or {}).get("q0")
             return answer if isinstance(answer, str) and answer else None
-        raw = clarify_tool([{"question": question, "choices": choices}], callback=callback)
+        # Hermes's own clarify tool through the public dispatch, with the agent's callback: the
+        # same redacted prompt and answer every surface renders for the model's clarify calls.
+        raw = _ctx.dispatch_tool("clarify", {"questions": [{"question": question, "choices": list(choices)}]},
+                                 callback=callback)
         try:
             data = json.loads(raw)
             response = (data.get("responses") or [{}])[0]
@@ -180,13 +181,17 @@ def _session(session_id: str, parent_agent) -> ChatSession:
 
 def _vault(handle: str):
     """Hermes's own vault (``hermes vault add``, or 1Password/Bitwarden when connected): the
-    backend that owns ``handle``, or None."""
+    backend that owns ``handle``, or None. Hermes publishes no way for a plugin to read a vault login
+    (``ctx.register_login_backend`` only adds a backend), so this is a private import."""
     from agent.vault_backends import backend_for_handle
 
     return backend_for_handle(handle)
 
 
 def _redact(secret: str) -> None:
+    """Scrub the typed password from anything later shown to the model. Private import: the public
+    ``ctx.register_redaction_patterns`` would hold the password as a global regex across profiles and
+    log it whenever it rejects one."""
     try:
         from agent.redact import register_vault_redaction_value
 
