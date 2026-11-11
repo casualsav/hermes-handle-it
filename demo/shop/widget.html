@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Northwind Outfitters · Orders</title>
+<style>
+  body { margin: 0; font: 15px/1.45 system-ui, sans-serif; background: #f4f1ea; color: #1d2327; }
+  header { background: #1f5f4a; color: #fff; padding: 14px 24px; font-weight: 600; }
+  main { padding: 24px; max-width: 700px; }
+  #launcher { position: fixed; right: 24px; bottom: 24px; background: #1f5f4a; color: #fff; border: 0;
+              border-radius: 24px; padding: 12px 20px; font: inherit; cursor: pointer; }
+  #frame { position: fixed; right: 24px; bottom: 80px; width: 420px; height: 640px; border: 0;
+           border-radius: 12px; box-shadow: 0 6px 24px rgba(0,0,0,.2); background: #fff; display: none; }
+</style>
+</head>
+<body>
+<header>Northwind Outfitters</header>
+<main>
+  <h2>Your orders</h2>
+  <p>Order #1234 · Ridgeline rain jacket · delivered.</p>
+  <p style="color:#6b7378;font-size:13px">Demo page: the support chat lives in an embedded widget, the way Intercom or Zendesk embed theirs.</p>
+</main>
+<button id="launcher" type="button">Chat with us</button>
+<iframe id="frame" title="Support chat"></iframe>
+<script>
+  document.getElementById("launcher").addEventListener("click", () => {
+    const f = document.getElementById("frame");
+    if (!f.src) f.src = "index.html" + location.search;
+    f.style.display = "block";
+  });
+</script>
+</body>
+</html>

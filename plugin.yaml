@@ -1,0 +1,20 @@
+name: hermes-support
+label: Hermes Support
+version: "0.1.0"
+author: casualsav
+license: MIT
+description: >
+  It waits on hold so you don't. Hermes holds a company's live customer-support chat for you in its own browser: it waits on the
+  human agent for as long as it takes, negotiates toward your goal, and asks you before it agrees to
+  an offer, pays, cancels or shares a detail you did not allow. Ends with the outcome and a transcript.
+requires_hermes: ">=0.21.5"
+provides_tools:
+  - support_chat_start
+  - support_chat_send
+  - support_chat_wait
+  - support_chat_end
+provides_hooks:
+  - pre_tool_call
+  - on_session_finalize
+python_dependencies:
+  - "playwright>=1.40,<2"
