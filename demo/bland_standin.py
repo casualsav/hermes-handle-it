@@ -38,6 +38,7 @@ class Call:
         self.step_s = step_s
         self.started = time.monotonic()
         self.tool_calls: list[dict] = []
+        self.priced_at = float("inf")  # like bland.ai, price and summary arrive a moment after the call ends
 
     def say(self, user: str, text: str) -> None:
         self.transcripts.append({"id": len(self.transcripts) + 1, "user": user, "text": text,
@@ -46,12 +47,13 @@ class Call:
 
     def details(self) -> dict:
         minutes = round((time.monotonic() - self.started) / 60, 2)
+        priced = time.monotonic() >= self.priced_at
         return {
             "call_id": self.id, "c_id": self.id, "to": self.payload.get("phone_number"), "from": "+15550000000",
             "status": "completed" if self.completed else "in-progress",
             "queue_status": "complete" if self.completed else "started", "completed": self.completed,
-            "answered_by": "human", "call_length": minutes, "price": round(minutes * PER_MINUTE, 3),
-            "summary": self.summary if self.completed else None, "metadata": self.payload.get("metadata"),
+            "answered_by": "human", "call_length": minutes, "price": round(minutes * PER_MINUTE, 3) if priced else None,
+            "summary": self.summary if priced else None, "metadata": self.payload.get("metadata"),
             "transcripts": list(self.transcripts), "error_message": None,
             "concatenated_transcript": "\n".join(f"{t['user']}: {t['text']}" for t in self.transcripts),
         }
@@ -121,6 +123,7 @@ class Call:
     def finish(self, last: str, summary: str) -> None:
         self.say("user", last)
         self.summary = summary
+        self.priced_at = time.monotonic() + 4.0
         self.completed = True
 
 
@@ -177,6 +180,7 @@ class StandIn:
                 if call is None:
                     return self._send(404, {"status": "error", "message": "Call not found"})
                 call.stopped = call.completed = True
+                call.priced_at = time.monotonic()
                 self._send(200, {"status": "success", "message": "Call ended successfully."})
 
             def log_message(self, *_a):

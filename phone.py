@@ -33,13 +33,14 @@ NO = "No: keep working toward the goal"
 END_CALL = "End the call"
 HOLD_S = 45.0  # bland.ai gives a tool at most 60 s; answer "pending" before that
 POLL_S = 3.0
+SETTLE_S = 45.0  # how long to wait for the price and summary after the call ends
 TOOL = "CheckWithAccountHolder"
 WHO = {"user": "support", "assistant": "you"}
 
 
 class CallSession:
     def __init__(self, phone_number: str, company: str, task: str, allowed: dict, private: list, folder: Path,
-                 max_minutes: int = 30, session_id: Optional[str] = None, clock: Callable[[], float] = time.monotonic,
+                 max_minutes: int = 30, record: bool = False, session_id: Optional[str] = None, clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep, poll_s: float = POLL_S, hold_s: float = HOLD_S) -> None:
         self.id = session_id or uuid.uuid4().hex[:8]
         self.phone_number = phone_number
@@ -48,6 +49,7 @@ class CallSession:
         self.guard = Guard(allowed=dict(allowed or {}), task=task, private=list(private or []))
         self.folder = folder
         self.max_minutes = max_minutes
+        self.record = record
         self.token = secrets.token_urlsafe(24)
         self.call_id: Optional[str] = None
         self.bridged = False
@@ -73,8 +75,10 @@ class CallSession:
             "",
             "If an automated phone menu answers, listen to the options and press the key or say the option that "
             "leads to a person in customer support for this goal. If you are put on hold, wait quietly.",
-            "Once you reach a person, explain the problem briefly and politely and work toward the goal. "
-            "If anyone asks whether you are an AI, say yes: you are an AI assistant calling for the account holder.",
+            "As soon as a person answers, say first that you are an AI assistant calling on behalf of a customer"
+            + (" and that the call is being recorded" if self.record else "")
+            + ". If they object, apologise, thank them and end the call. Then explain the problem briefly and "
+            "politely and work toward the goal.",
             "",
             "Details you may share when they are asked for:",
             shareable,
@@ -100,7 +104,7 @@ class CallSession:
                 "support makes an offer or asks for something else, ask them to note it on the case, repeat the "
                 "offer back so it is clear, and say the account holder will decide and follow up.",
             ]
-        lines += ["", "Before you end the call, ask for a reference or case number and repeat back what was agreed."]
+        lines += ["", "If anything was agreed, ask for a reference or case number and repeat it back before you end the call."]
         return "\n".join(lines)
 
     def payload(self, bridge_url: Optional[str]) -> dict:
@@ -110,7 +114,7 @@ class CallSession:
             "task": self.instructions(),
             "ivr_mode": True,
             "wait_for_greeting": True,
-            "record": False,
+            "record": self.record,
             "max_duration": self.max_minutes,
             "metadata": {"support_call": self.id},
         }
@@ -179,12 +183,17 @@ class CallSession:
             if self.ended or self._clock() - start >= max_wait_s:
                 break
             self._sleep(self._poll)
+        # bland.ai marks a call completed before it has priced and summarised it
+        settle = self._clock()
+        while self.ended and self.details.get("price") is None and self._clock() - settle < SETTLE_S:
+            self._sleep(self._poll)
+            heard += self._read(client)
         self.save()
         out = {"status": "call_ended" if self.ended else "on_call", "support_said": heard,
                "waited_s": round(self._clock() - start)}
         if self.ended:
             out.update({k: self.details.get(k) for k in ("summary", "call_length", "price", "answered_by",
-                                                         "error_message") if self.details.get(k) is not None})
+                                                         "recording_url", "error_message") if self.details.get(k) is not None})
             out["hint"] = "The call is over. Call support_call_end with the outcome."
         else:
             out["hint"] = "Still on the call. Call support_call_wait to keep following it."
@@ -271,7 +280,8 @@ class CallSession:
             f"- **Resolved:** {'yes' if resolved else 'no'}",
             f"- **Approvals asked:** {len(self.approvals)}",
         ]
-        for key, label in (("call_length", "Length (min)"), ("price", "Cost (USD)"), ("summary", "bland.ai summary")):
+        for key, label in (("call_length", "Length (min)"), ("price", "Cost (USD)"), ("summary", "bland.ai summary"),
+                           ("recording_url", "Recording")):
             if self.details.get(key) is not None:
                 body.append(f"- **{label}:** {self.details[key]}")
         if audit:
@@ -307,7 +317,7 @@ class CallSession:
         state = {
             "id": self.id, "phone_number": self.phone_number, "company": self.company, "task": self.task,
             "allowed": self.guard.allowed, "private": self.guard.private, "max_minutes": self.max_minutes,
-            "token": self.token, "call_id": self.call_id, "bridged": self.bridged, "seen": self.seen,
+            "record": self.record, "token": self.token, "call_id": self.call_id, "bridged": self.bridged, "seen": self.seen,
             "turns": [asdict(t) for t in self.turns], "questions": [{k: v for k, v in q.items() if k != "asking"}
                                                                     for q in self.questions],
             "approvals": self.approvals, "details": self.details, "ended": self.ended, "closed": self.closed,
@@ -320,7 +330,7 @@ class CallSession:
     def restore(cls, folder: Path, **kw) -> "CallSession":
         st = json.loads((folder / "session.json").read_text(encoding="utf-8"))
         s = cls(st["phone_number"], st["company"], st["task"], st["allowed"], st["private"], folder,
-                max_minutes=st["max_minutes"], session_id=st["id"], **kw)
+                max_minutes=st["max_minutes"], record=st.get("record", False), session_id=st["id"], **kw)
         s.token, s.call_id, s.bridged, s.seen = st["token"], st["call_id"], st["bridged"], list(st["seen"])
         s.turns = [Turn(**t) for t in st["turns"]]
         s.questions, s.approvals, s.details = list(st["questions"]), list(st["approvals"]), dict(st["details"])

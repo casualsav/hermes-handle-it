@@ -88,7 +88,7 @@ def start(args: dict, parent_agent=None, **_kw) -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     call = CallSession(number, str(args.get("company") or "").strip(), task,
                        {str(k): str(v) for k, v in shareable.items()}, [str(v) for v in never], folder=Path(),
-                       max_minutes=minutes)
+                       max_minutes=minutes, record=bool(args.get("record")))
     call.folder = handlers._root() / "calls" / f"{stamp}-{call.id}"
     call.progress = _progress(parent_agent)
     url = _bridge_url()
@@ -169,6 +169,7 @@ START = {
                           "description": "Details the user allows sharing, label -> value. The voice agent knows nothing else."},
             "never_share": {"type": "array", "items": {"type": "string"}, "description": "Values that must never be said on the call."},
             "max_minutes": {"type": "integer", "description": "Hang up after this many minutes, default 30, max 120."},
+            "record": {"type": "boolean", "description": "Record the call (bland.ai keeps the audio). Only when the user asked; the agent tells support the call is recorded."},
             "max_wait_s": {"type": "number", "description": "How long this call follows the call before returning, default 240."},
         },
         "required": ["phone_number", "task"],

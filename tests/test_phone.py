@@ -83,6 +83,7 @@ def test_offer_on_the_call_comes_back_for_approval_and_outcome_is_saved(standin)
         "Thanks, but the jacket is unusable after two weeks. The account holder would like the full $180 refund.")
 
     assert out["summary"] == "Full $180 refund agreed, reference RF-48213."
+    assert out["price"] is not None
     done = json.loads(phone_tools.end({"session_id": sid, "outcome": "Full $180 refund, RF-48213",
                                        "resolved": True}, parent_agent=user))
     text = Path(done["transcript_file"]).read_text()

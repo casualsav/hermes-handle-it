@@ -79,3 +79,15 @@ These are bland.ai's prices, read on 2026-11-11 at
 
 A 10-minute support call costs about $1.40. An hour on hold costs $8.40, so `max_minutes`
 (default 30, at most $4.20) caps every call.
+
+## What it has been tried on
+
+On 2026-11-11, one real call went to Best Buy's customer-care line. The question was a general
+one: what is the return window for online orders. No account details were shared. As soon as it
+was answered, the agent said it was an AI assistant and that the call was being recorded.
+Best Buy's own AI assistant answered. The agent got past its menu and came back with the
+policy: 15 days for most products, 60 for members. It turned down the offer of a text. The call
+took 1.6 minutes and cost $0.22. Real bland.ai prices and summarises a call a few seconds after
+marking it completed, so `support_call_wait` waits for the price before it returns.
+
+`record: true` keeps bland.ai's recording, and the agent then says the call is being recorded.
