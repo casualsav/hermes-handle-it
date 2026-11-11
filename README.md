@@ -88,6 +88,23 @@ hermes chat
 
 Add `&login=1` to put the chat behind a sign-in (demo password `northwind-demo`; save it with `hermes vault add` for origin `http://127.0.0.1:8765`), or `&login=2fa` to add a code step. The stand-in "human" agent, Dana, replies with realistic pauses and a typing indicator, asks for the order number and the name on the order, offers a 20% partial refund, checks with a supervisor if you hold out, then offers the full $180. Add `?speed=0.3` to the URL to make her quicker. `demo/record/record.sh demo/raw` reproduces the recording on a virtual display (needs Xvfb, tmux, ffmpeg): the agent's screen and the user's terminal as two aligned videos.
 
+## Phone calls (bland.ai)
+
+Handle It can also phone a company's support line for you, through [bland.ai](https://www.bland.ai). Calls use your own bland.ai account: set `BLAND_API_KEY`.
+
+> "Call Best Buy's customer care on +1 888 237 8289 and ask what their return window is for online orders."
+
+bland.ai's voice agent places the call and gets through the company's phone menu from what you asked, with no key sequence given in advance. It says at once that it is an AI assistant calling for a customer. It knows only the details you allow, and it talks to support. The tools are `support_call_start`, `support_call_wait` and `support_call_end`. A call is capped by `max_minutes` (default 30). The transcript, outcome and cost are saved under `$HERMES_HOME/hermes-handle-it/calls/`.
+
+What calling is and is not:
+
+- **Approval.** By default, an offer made on a call comes back to you after the call ends, not during it. The voice agent is told it cannot agree to anything, so it gets the offer noted and says you will follow up. You get approval during the call only if you run a public HTTPS address for this machine's approval bridge (`SUPPORT_CALL_BRIDGE_URL`, for example a tunnel). bland.ai can then ask you through Hermes while support holds.
+- **Speech.** The voice agent speaks without going through this plugin. The plugin checks the call's transcript afterwards against your allowed details and approvals, and notes anything outside them.
+- **Tried:** once, on a real retailer's automated support line. It asked a general question, the return window for online orders, and came back with the answer in 1.6 minutes for $0.22.
+- **Not tried:** a human support agent on the line, and approval during a call.
+
+Recording (`record: true`) keeps bland.ai's recording of the call, and the agent says the call is being recorded. Costs are bland.ai's and they are yours: about $0.14 per connected minute on its free plan. Details are in [docs/phone.md](docs/phone.md).
+
 ## What it has been tried on
 
 - **Tried:** the demo shop above, end to end in Hermes Agent 0.21.5 on Linux (arm64) with DeepSeek as the model, in the CLI, including the vault sign-in; in tests, the chat inside the page, the same chat inside an iframe behind a "Chat with us" launcher (the shape of Intercom, Zendesk and similar widgets), and a sign-in with a one-time code. Unit tests cover the guard (including an offer stated without a question, and a reply that takes it without saying "agree"), the reader, the waiting loop, approvals and restart.
@@ -100,12 +117,15 @@ How it reads any chat: it compares the visible text of the page and all its fram
 The conversation loop (`session.py`) talks to a *channel* with five methods: `text()`, `send()`, `find_composer()`, `screenshot()`, `close()`. The browser page (`browser.py`) is the one channel today; a phone channel through a calling plugin could implement the same five and reuse the loop, the guard and the approvals unchanged.
 
 ```
-__init__.py   register(): four tools, the pre_tool_call approval hook, on_session_finalize
+__init__.py   register(): seven tools, the pre_tool_call approval hook, on_session_finalize
 handlers.py   tool schemas and handlers, reaching the user (approval, progress)
 session.py    the loop: wait for replies, gate every message, save state, transcript
 guard.py      what needs the user's OK: details not allowed, commitments, card numbers
 reader.py     turning page text into "Dana: …" messages, typing and end-of-chat markers
 browser.py    Playwright on its own thread, persistent profile, chat box and launcher finding
+bland.py      bland.ai's call API: place, read, stop
+phone.py      a support call: its instructions, the approval bridge, transcript and check
+phone_tools.py the three call tools
 demo/         the stand-in shop, its server, and the recording script
 ```
 
@@ -121,7 +141,7 @@ The plugin's name is set once, in `plugin.yaml` (`name:`); the data folder follo
 
 ## Disclosure
 
-Opens the support pages you name in a local Chromium and types into them on your behalf. Reads a login's password from Hermes's own vault only when you pass its handle, and only types it on the origin it was saved for. Saves transcripts, screenshots and the browser profile under `$HERMES_HOME/hermes-handle-it/`. No other network calls, no telemetry, no stored credentials.
+Opens the support pages you name in a local Chromium and types into them on your behalf. For phone calls, it talks to bland.ai's API with your own key, places phone calls to the numbers you name, and bland.ai records the call when you ask it to; call costs are yours, billed by bland.ai. Reads a login's password from Hermes's own vault only when you pass its handle, and only types it on the origin it was saved for. Saves transcripts, screenshots and the browser profile under `$HERMES_HOME/hermes-handle-it/`. No other network calls, no telemetry, no stored credentials.
 
 ## License
 
