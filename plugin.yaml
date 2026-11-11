@@ -1,10 +1,10 @@
-name: hermes-support
-label: Hermes Support
+name: hermes-handle-it
+label: Handle It
 version: "0.1.0"
 author: casualsav
 license: MIT
 description: >
-  It waits on hold so you don't. Hermes holds a company's live customer-support chat for you in its own browser: it waits on the
+  Handle It: your agent sits in the customer support chat so you don't have to. Hermes holds a company's live customer-support chat for you in its own browser: it waits on the
   human agent for as long as it takes, negotiates toward your goal, and asks you before it agrees to
   an offer, pays, cancels or shares a detail you did not allow. Ends with the outcome and a transcript.
 requires_hermes: ">=0.21.5"

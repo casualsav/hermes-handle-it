@@ -195,3 +195,26 @@ def test_a_question_back_does_not_answer_the_offer(tmp_path):
     s.wait_for_reply()
     out = s.send("Is the return label prepaid?", ask=lambda q, c: 1 / 0)
     assert out["support_said"] == ["Dana: Yes, it's prepaid."]
+
+
+def test_statement_offer_and_a_plain_yes_wait_for_the_user(tmp_path):
+    """Support states an offer with no question and the model, marking it only 'inform', says yes:
+    the guard alone stops it for the user's approval."""
+    s, page, clock = session(tmp_path, {})
+    s.wait_for_reply()
+    page.lines += ["Dana", "I can offer a $36 store credit."]
+    s.wait_for_reply()
+    action, question = s.before_approval("Yes, that works", "inform")
+    assert action == "ask" and "$36 store credit" in question
+    assert page.sent == [HOLD]
+
+
+def test_statement_offer_asks_the_user_on_a_direct_call(tmp_path):
+    s, page, clock = session(tmp_path, {})
+    s.wait_for_reply()
+    page.lines += ["Dana", "I can offer a $36 store credit."]
+    s.wait_for_reply()
+    asked = []
+    out = s.send("Yes, that works", intent="inform", ask=lambda q, choices: asked.append(q) or DECLINE_OFFER)
+    assert asked and "$36 store credit" in asked[0]
+    assert "Yes, that works" not in page.sent and out["status"] == "user_declined_offer"

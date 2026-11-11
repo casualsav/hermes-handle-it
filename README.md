@@ -1,8 +1,6 @@
-# Hermes Support
+# Handle It
 
-**Hermes Support handles customer-support chats for you: you tell Hermes what you want from a company, and it sits in that company's live support chat on your behalf until it's done.**
-
-*It waits on hold so you don't.*
+**Your agent sits in the customer support chat so you don't have to: you tell Hermes what you want from a company, and it sits in that company's live support chat on your behalf until it's done.**
 
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin. (Not a help desk for Hermes itself: it is Hermes being your representative in someone else's support chat.)
 
@@ -37,7 +35,7 @@ A model told to "go handle my support chat" will happily say yes to the first of
 - **The approval gate.** Every outgoing message is checked before it is typed. When support makes an offer and asks for a yes, the answer is yours, whichever way the model leans: you see the offer and the reply Hermes drafted, and accept or turn it down. Anything that pays, buys, cancels or authorises something is shown to you first too. *Silence accepts nothing*: no answer means nothing is sent. While you decide, Hermes tells the agent "One moment please, I'm checking with the account holder." Card numbers are never typed at all, even with a yes: paying is left to you.
 - **The shareable-details list.** You say what Hermes may share (`order number`, `name`, `email`…). Email addresses, phone numbers, account or card numbers and secrets (passwords, one-time codes) that are not on the list, not in your own words and not first said by support, need your OK. So does any answer to "can you confirm your …?" that contains none of the listed details. Values you mark `never_share` are caught verbatim.
 - **The waiting loop with no time cap.** Hermes polls the chat every second and counts a reply once support has been quiet for three seconds and is not typing, so a reply split over several bubbles arrives whole. A wait that runs out returns `still_waiting` and Hermes waits again: an hour on hold is just more waits. Every step is saved, so a chat survives the end of a turn or a restart of Hermes and carries on from its saved transcript, in the same browser profile so the chat widget finds its conversation again.
-- **Sign-in without the model seeing the password.** When the chat sits behind a login, Hermes Support uses Hermes's own vault (`hermes vault add`, or 1Password / Bitwarden when connected): the model passes only a handle from `browser_vault_list`; the plugin resolves the password in-process, checks the page is exactly the origin the login was saved for, types it into the site's own form and drops it. It never appears in a tool result, so never in the model's context, and it is registered with Hermes's redaction. A one-time code comes from the vault's TOTP seed or is asked of you and typed the same way; a captcha is handed to you in the visible browser window.
+- **Sign-in without the model seeing the password.** When the chat sits behind a login, Handle It uses Hermes's own vault (`hermes vault add`, or 1Password / Bitwarden when connected): the model passes only a handle from `browser_vault_list`; the plugin resolves the password in-process, checks the page is exactly the origin the login was saved for, types it into the site's own form and drops it. It never appears in a tool result, so never in the model's context, and it is registered with Hermes's redaction. A one-time code comes from the vault's TOTP seed or is asked of you and typed the same way; a captcha is handed to you in the visible browser window.
 - **Progress you can see.** While it waits, Hermes's status line shows what is happening (`💬 support chat · Support is typing…`, `Support: …`, `Still holding the support chat (120s without a reply)`), and every reply is screenshotted into the chat's folder.
 
 ## Install
@@ -45,12 +43,12 @@ A model told to "go handle my support chat" will happily say yes to the first of
 Requires Hermes Agent ≥ 0.21.5 and Playwright with a Chromium.
 
 ```bash
-hermes plugins install casualsav/hermes-support --enable
+hermes plugins install casualsav/hermes-handle-it --enable
 # Playwright's Chromium, if this machine has none:
 ~/.hermes/hermes-agent/venv/bin/python -m playwright install chromium
 ```
 
-Or by hand: copy this directory to `~/.hermes/plugins/hermes-support/`, then `hermes plugins enable hermes-support`. Start a new Hermes session; `hermes tools list` shows the `support_chat` toolset.
+Or by hand: copy this directory to `~/.hermes/plugins/hermes-handle-it/`, then `hermes plugins enable hermes-handle-it`. Start a new Hermes session; `hermes tools list` shows the `support_chat` toolset.
 
 ## Use
 
@@ -67,7 +65,7 @@ Tools the model uses (you don't call them yourself):
 | `support_chat_wait` | keeps holding without sending |
 | `support_chat_end` | closes the chat, writes `transcript.md`, returns the outcome |
 
-Chats live in `$HERMES_HOME/hermes-support/chats/<time>-<id>/`: `transcript.md`, `session.json` and a screenshot per reply.
+Chats live in `$HERMES_HOME/hermes-handle-it/chats/<time>-<id>/`: `transcript.md`, `session.json` and a screenshot per reply.
 
 ### Where the approval appears
 
@@ -76,7 +74,7 @@ Chats live in `$HERMES_HOME/hermes-support/chats/<time>-<id>/`: `transcript.md`,
 
 ### Browser
 
-Hermes Support runs its own Chromium through Playwright, with a profile in `$HERMES_HOME/hermes-support/browser-profile`. It is headless by default; it shows its window when Hermes's `browser.headed` is set or `AGENT_BROWSER_HEADED=1`, which is how the demo shows it on a desktop. If Hermes's `browser.cdp_url` is set, it attaches to that browser instead, so it can drive the browser on Hermes's own desktop.
+Handle It runs its own Chromium through Playwright, with a profile in `$HERMES_HOME/hermes-handle-it/browser-profile`. It is headless by default; it shows its window when Hermes's `browser.headed` is set or `AGENT_BROWSER_HEADED=1`, which is how the demo shows it on a desktop. If Hermes's `browser.cdp_url` is set, it attaches to that browser instead, so it can drive the browser on Hermes's own desktop.
 
 ## Try the demo yourself
 
@@ -92,8 +90,8 @@ Add `&login=1` to put the chat behind a sign-in (demo password `northwind-demo`;
 
 ## What it has been tried on
 
-- **Tried:** the demo shop above, end to end in Hermes Agent 0.21.5 on Linux (arm64) with DeepSeek as the model, in the CLI, including the vault sign-in; in tests, the chat inside the page, the same chat inside an iframe behind a "Chat with us" launcher (the shape of Intercom, Zendesk and similar widgets), and a sign-in with a one-time code. Unit tests cover the guard, the reader, the waiting loop, approvals and restart.
-- **Not tried yet:** a real company's live chat (it would mean talking to real people at a real company), the gateway approval path on a messaging platform, macOS, and chats that require a login or a pre-chat form first (`support_chat_start` reports that it found no message box; log in once in the plugin's browser profile and try again).
+- **Tried:** the demo shop above, end to end in Hermes Agent 0.21.5 on Linux (arm64) with DeepSeek as the model, in the CLI, including the vault sign-in; in tests, the chat inside the page, the same chat inside an iframe behind a "Chat with us" launcher (the shape of Intercom, Zendesk and similar widgets), and a sign-in with a one-time code. Unit tests cover the guard (including an offer stated without a question, and a reply that takes it without saying "agree"), the reader, the waiting loop, approvals and restart.
+- **Not tried yet:** a real company's live chat (it would mean talking to real people at a real company; real widgets add cookie banners, pre-chat forms, canvas and closed shadow DOM), the approval card on a messaging gateway such as Telegram (the hook returns Hermes's standard `approve` action, but no gateway run has shown the card arriving), macOS, and chats that require a login or a pre-chat form first (`support_chat_start` reports that it found no message box; log in once in the plugin's browser profile and try again).
 
 How it reads any chat: it compares the visible text of the page and all its frames between polls, so it needs no per-site code; it finds the message box by its role and label, and presses Enter or the Send button. Widgets that draw messages on a canvas or in closed shadow DOM would need more.
 
@@ -123,7 +121,7 @@ The plugin's name is set once, in `plugin.yaml` (`name:`); the data folder follo
 
 ## Disclosure
 
-Opens the support pages you name in a local Chromium and types into them on your behalf. Reads a login's password from Hermes's own vault only when you pass its handle, and only types it on the origin it was saved for. Saves transcripts, screenshots and the browser profile under `$HERMES_HOME/hermes-support/`. No other network calls, no telemetry, no stored credentials.
+Opens the support pages you name in a local Chromium and types into them on your behalf. Reads a login's password from Hermes's own vault only when you pass its handle, and only types it on the origin it was saved for. Saves transcripts, screenshots and the browser profile under `$HERMES_HOME/hermes-handle-it/`. No other network calls, no telemetry, no stored credentials.
 
 ## License
 

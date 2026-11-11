@@ -51,9 +51,25 @@ CONSENT = re.compile(
 )
 
 
+PROPOSE = re.compile(
+    r"(\b(?:i|we)(?:'?d| would)? (?:can|could|will|'?ll|am able to|are able to|be (?:happy|glad|able) to|happy to)"
+    r"(?: also)? (?:offer|give|issue|provide|do|refund|credit|send|replace|exchange|waive|apply|extend|upgrade|"
+    r"process|arrange|ship|reduce|discount|match)\b|\boffer(?:ing|ed)?\b|\bhow about\b|\bwhat about\b|"
+    r"\balternatively\b|\boption\b|\bthe best (?:i|we) can\b)",
+    re.I,
+)
+DONE = re.compile(
+    r"\b(done|processed|has been|have been|is (?:now )?complete|completed|went through|all set|anything else)\b", re.I)
+
+
 def is_offer(text: str) -> bool:
-    """Support offers something and asks for a yes: "I can refund $36. Would that work?"."""
-    return bool(OFFER.search(text) and CONSENT.search(text) and "?" in text)
+    """Support offers something: "I can offer a $36 store credit.", "I can refund $36. Would that work?".
+    A question about money that is not a finished action counts too: when unsure, it is an offer."""
+    if not OFFER.search(text):
+        return False
+    if CONSENT.search(text) or PROPOSE.search(text):
+        return True
+    return "?" in text and not DONE.search(text)
 
 
 REQUEST = re.compile(
@@ -63,6 +79,12 @@ REQUEST = re.compile(
 )
 CARD = re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)")
 NEGATION = re.compile(r"\b(no|not|don'?t|do not|won'?t|can'?t|cannot|never|decline|rather not|instead)\b|n't\b", re.I)
+# Phrases with a "no" in them that do not turn anything down.
+BENIGN = re.compile(r"\b(no problem|no worries|not a problem|no rush|don'?t worry|why not|can'?t wait|can'?t complain)\b", re.I)
+# Words that take what was offered without a yes in them.
+ACCEPTISH = re.compile(r"\b(fine|great|perfect|good|alright|happy|glad|lovely|excellent|take it|works?)\b", re.I)
+# A reply that holds back or bargains rather than accepting.
+HOLDING = re.compile(r"\b(prefer|rather|instead|hold off|think about|let me check|not sure|full refund)\b", re.I)
 
 
 @dataclass
@@ -87,6 +109,7 @@ class Guard:
     private: list = field(default_factory=list)  # values the user said never to share
     task: str = ""  # the user's own words for the goal
     heard: list = field(default_factory=list)  # what the support agent has said
+    answered: int = 0  # how much of ``heard`` came before our last real reply
 
     def allowed_values(self) -> list[str]:
         values = [str(v) for v in self.allowed.values() if str(v).strip()]
@@ -163,21 +186,27 @@ class Guard:
         return out
 
     def commitments(self, message: str) -> list[Finding]:
-        """A "yes" counts as agreeing only when the agent's last message offered or asked to do
-        something; paying, buying or cancelling counts always."""
-        last = self.heard[-1] if self.heard else ""
-        offer_pending = is_offer(last)
+        """A reply to an open offer counts as agreeing unless it clearly turns it down, holds back
+        or asks back; paying, buying or cancelling counts always."""
+        offer_pending = any(is_offer(h) for h in self.heard[self.answered:])
         out: list[Finding] = []
         for sentence in re.split(r"(?<=[.!?\n])\s+", message):
             if not sentence.strip():
                 continue
             pay = PAYMENT.search(sentence)
-            if pay and not NEGATION.search(sentence[: pay.start()]):
+            if pay and not NEGATION.search(BENIGN.sub("", sentence[: pay.start()])):
                 out.append(Finding("commitment", sentence.strip(), "it pays, buys, cancels or authorises something"))
                 continue
             affirm = AFFIRM.search(sentence)
-            if affirm and offer_pending and not NEGATION.search(sentence):
+            negation = NEGATION.search(BENIGN.sub(lambda m: " " * len(m.group()), sentence))
+            if affirm and offer_pending and (negation is None or affirm.start() < negation.start()):
                 out.append(Finding("commitment", sentence.strip(), "it agrees to what the support agent offered"))
+        if offer_pending and not out:
+            plain = BENIGN.sub("", message)
+            about_it = OFFER.search(plain) or ACCEPTISH.search(plain)
+            if about_it and not NEGATION.search(plain) and not HOLDING.search(plain) and not message.rstrip().endswith("?"):
+                out.append(Finding("commitment", message.strip(),
+                                   "it answers the support agent's offer without turning it down"))
         return out
 
     def check(self, message: str, declared_intent: str = "") -> list[Finding]:

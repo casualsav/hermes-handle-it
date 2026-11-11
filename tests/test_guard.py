@@ -73,3 +73,20 @@ def test_closing_question_is_not_an_offer():
     assert is_offer("My supervisor approved a full refund of $180. Shall I go ahead and process it?")
     g = make(heard=["Done! Refund RF-48213 for $180 is processed. Anything else I can help with?"])
     assert g.check("Yes, that's all, thanks!") == []
+
+
+def test_offer_stated_without_a_question_is_caught():
+    from support_chat_plugin.guard import is_offer
+
+    assert is_offer("I can offer a $36 store credit.")
+    g = make(heard=["I can offer a $36 store credit."])
+    assert kinds(g.check("Yes, that works")) == ["commitment"]
+    assert kinds(g.check("Yes, that works, no problem.")) == ["commitment"]
+    assert kinds(g.check("The store credit is fine.")) == ["commitment"]
+    assert g.check("No, I'd rather have a full refund.") == []
+    assert g.check("Could you make it a refund to my card instead?") == []
+
+
+def test_offer_followed_by_another_bubble_is_still_open():
+    g = make(heard=["I can offer a $36 store credit.", "Let me know!"])
+    assert kinds(g.check("Yes, that works")) == ["commitment"]
