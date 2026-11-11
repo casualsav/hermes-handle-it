@@ -249,7 +249,7 @@ def sign_in(page, handle: str, parent_agent, progress) -> dict:
             return {"signed_in": False, "status": "needs_user",
                     "error": "The sign-in needs a person (captcha or another check) and nobody can be asked here."}
         answer = ask(f"{here} wants a check only you can do (a captcha or similar). Finish signing in in the "
-                     "Hermes Support browser window, then choose Done.", ["Done", "Cancel"])
+                     "Handle It browser window, then choose Done.", ["Done", "Cancel"])
         if answer != "Done" or page.password_visible():
             return {"signed_in": False, "status": "user_stopped", "error": "Sign-in was not finished."}
     progress(f"Signed in to {here}.")

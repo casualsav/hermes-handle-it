@@ -75,6 +75,7 @@ class ChatSession:
             "private": self.guard.private, "heard": self.guard.heard, "turns": [asdict(t) for t in self.turns],
             "sent": self.sent, "approvals": self.approvals, "ended": self.ended, "closed": self.closed,
             "lines": self._lines, "shots": self._shots, "pending": self.pending, "decided": self.decided,
+            "answered": self.guard.answered,
         }
         tmp = self.folder / "session.json.tmp"
         tmp.write_text(json.dumps(state, indent=1, ensure_ascii=False), encoding="utf-8")
@@ -87,6 +88,7 @@ class ChatSession:
                 session_id=state["id"], **kw)
         s.page = page
         s.guard.heard = list(state["heard"])
+        s.guard.answered = state.get("answered", 0)
         s.turns = [Turn(**t) for t in state["turns"]]
         s.sent = list(state["sent"])
         s.approvals = list(state["approvals"])
@@ -153,6 +155,8 @@ class ChatSession:
     def _type(self, message: str) -> None:
         self.page.send(message)
         self.sent.append(message)
+        if message != HOLD:
+            self.guard.answered = len(self.guard.heard)
         self.turns.append(Turn("you", message))
         self.progress(f"Sent: {message}")
         self.save()
@@ -240,13 +244,12 @@ class ChatSession:
         return "ask", _question(last, message, findings)
 
     def open_offer(self) -> Optional[str]:
-        """Support's last message when it is an offer we have not answered yet (our hold line
-        does not answer it)."""
+        """Support's latest offer since our last reply (our hold line does not answer it)."""
         for t in reversed(self.turns):
             if t.who == "you" and t.text != HOLD:
                 return None
-            if t.who == "support":
-                return t.text if is_offer(t.text) else None
+            if t.who == "support" and is_offer(t.text):
+                return t.text
         return None
 
     def _offer_call(self, offer: str, message: str, accepting: bool, findings: list, ask: Ask) -> tuple[bool, dict]:
