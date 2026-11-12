@@ -18,15 +18,44 @@ from concurrent.futures import Future
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from . import netguard
+
 COMPOSERS = ("textarea", '[contenteditable="true"]', '[role="textbox"]', 'input[type="text"]', "input:not([type])")
 COMPOSER_HINT = re.compile(r"message|type|chat|reply|write|ask|question", re.I)
 LAUNCHER = re.compile(r"(live chat|chat with|chat now|start (a )?chat|message us|contact support|talk to|^chat$|get help)", re.I)
-CODE_HINT = re.compile(r"one-time|otp|2fa|two.factor|verification|security code|sign.in code|\bcode\b", re.I)
 SEND = re.compile(r"^\s*send\b|^submit$", re.I)
 
 
 class BrowserUnavailable(RuntimeError):
     pass
+
+
+class Refused(RuntimeError):
+    """The page, a redirect hop or a frame of it is an address the browser may not open."""
+
+
+class _Guard:
+    """Checks every document load of one page before the browser sends it: the page itself, each
+    redirect hop and each frame. Chromium pauses each hop as its own request here (Playwright's
+    ``route`` never sees redirects), and a refused one fails with ERR_BLOCKED_BY_CLIENT."""
+
+    def __init__(self, context, page) -> None:
+        self.refused: list[str] = []
+        self._cdp = context.new_cdp_session(page)
+        self._cdp.on("Fetch.requestPaused", self._paused)
+        self._cdp.send("Fetch.enable", {"patterns": [
+            {"urlPattern": "*", "resourceType": "Document", "requestStage": "Request"}]})
+
+    def _paused(self, event: dict) -> None:
+        why = netguard.refusal(str((event.get("request") or {}).get("url") or ""))
+        try:
+            if why:
+                self.refused.append(why)
+                self._cdp.send("Fetch.failRequest", {"requestId": event["requestId"], "errorReason": "BlockedByClient"})
+            else:
+                self._cdp.send("Fetch.continueRequest", {"requestId": event["requestId"]})
+        except Exception:
+            pass  # the page or its target went away
 
 
 def _hermes_browser_setting(key: str, default: Any = None) -> Any:
@@ -94,6 +123,7 @@ class Browser:
         self._pw = None
         self._browser = None
         self._context = None
+        self._guards: dict = {}
         self.headed = False
 
     def _alive(self) -> bool:
@@ -136,11 +166,33 @@ class Browser:
             + " | ".join(errors))
 
     def open(self, url: str) -> "Page":
+        """Opens ``url`` in a guarded tab. Raises ``Refused`` when the address, any redirect hop or a
+        frame of the page is private, loopback, link-local or a cloud metadata endpoint."""
+        why = netguard.refusal(url)
+        if why:
+            raise Refused(f"Not opening {url}: {why}.")
+
         def go():
             self._ensure()
             blank = [p for p in self._context.pages if p.url in ("about:blank", "")]
             page = blank[0] if blank else self._context.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            guard = self._guards.get(page)
+            if guard is None:
+                guard = self._guards[page] = _Guard(self._context, page)
+                page.on("close", lambda closed: self._guards.pop(closed, None))
+            guard.refused.clear()
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            except Exception:
+                if not guard.refused:
+                    raise
+            if guard.refused:
+                why = guard.refused[-1]
+                try:
+                    page.goto("about:blank")
+                except Exception:
+                    pass
+                raise Refused(f"Stopped loading {url}: it leads to {why}.")
             return page
 
         return Page(self, self._owner.call(go, timeout=90))
@@ -155,6 +207,7 @@ class Browser:
                     self._context.close()
             finally:
                 self._context = self._browser = None
+                self._guards.clear()
                 if self._pw is not None:
                     self._pw.stop()
                     self._pw = None
@@ -176,6 +229,8 @@ class Page:
         def read():
             parts = []
             for frame in self._page.frames:
+                if netguard.refusal(frame.url):
+                    continue  # never read a frame the guard would not have loaded
                 try:
                     parts.append(frame.locator("body").inner_text(timeout=3000))
                 except Exception:
@@ -259,84 +314,6 @@ class Page:
                         break
 
         self._b.run(type_and_send, timeout=60)
-
-    # --- signing in: the password goes from Hermes's vault into the field, nowhere else ---------
-
-    def origin(self) -> str:
-        def get():
-            from urllib.parse import urlsplit
-
-            u = urlsplit(self._page.url)
-            return f"{u.scheme}://{u.netloc}"
-
-        return self._b.run(get, timeout=10)
-
-    def _visible(self, selector: str):
-        loc = self._page.main_frame.locator(selector)
-        for i in range(loc.count()):
-            el = loc.nth(i)
-            try:
-                if el.is_visible() and el.is_editable():
-                    return el
-            except Exception:
-                continue
-        return None
-
-    def password_visible(self) -> bool:
-        return bool(self._b.run(lambda: self._visible('input[type="password"]') is not None, timeout=15))
-
-    def fill_login(self, identifier: str, password: str) -> bool:
-        """Types the identifier and password into the page's sign-in form and submits it."""
-
-        def fill():
-            pw = self._visible('input[type="password"]')
-            if pw is None:
-                return False
-            if identifier:
-                user = self._visible('input[autocomplete="username"], input[autocomplete="email"], input[type="email"], '
-                                     'input[name*="user" i], input[name*="email" i], input[id*="email" i], input[type="text"]')
-                if user is not None:
-                    user.fill(identifier, timeout=10000)
-            pw.fill(password, timeout=10000)
-            pw.press("Enter")
-            self._page.wait_for_timeout(1500)
-            return True
-
-        return bool(self._b.run(fill, timeout=60))
-
-    def code_field_visible(self) -> bool:
-        def find():
-            return self._code_field() is not None
-
-        return bool(self._b.run(find, timeout=15))
-
-    def _code_field(self):
-        el = self._visible('input[autocomplete="one-time-code"]')
-        if el is not None:
-            return el
-        loc = self._page.main_frame.locator('input:not([type="password"]):not([type="hidden"])')
-        for i in range(loc.count()):
-            e = loc.nth(i)
-            try:
-                hint = " ".join(filter(None, (e.get_attribute("aria-label"), e.get_attribute("placeholder"),
-                                              e.get_attribute("name"), e.get_attribute("id"))))
-                if e.is_visible() and CODE_HINT.search(hint):
-                    return e
-            except Exception:
-                continue
-        return None
-
-    def fill_code(self, code: str) -> bool:
-        def fill():
-            el = self._code_field()
-            if el is None:
-                return False
-            el.fill(code, timeout=10000)
-            el.press("Enter")
-            self._page.wait_for_timeout(1500)
-            return True
-
-        return bool(self._b.run(fill, timeout=30))
 
     def screenshot(self, path: Path) -> Optional[str]:
         def shoot():

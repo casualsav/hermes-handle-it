@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from .browser import Browser, BrowserUnavailable
+from .browser import Browser, BrowserUnavailable, Refused
 from .session import ChatSession, Turn
 
 logger = logging.getLogger(__name__)
@@ -27,13 +27,16 @@ def bind(ctx) -> None:
     _ctx = ctx
 
 
-def _agent(parent_agent):
-    """The running agent: passed in by some dispatch paths; in the CLI the same one
-    ``ctx.dispatch_tool`` resolves."""
-    if parent_agent is not None:
-        return parent_agent
-    manager = getattr(_ctx, "_manager", None)
-    return getattr(getattr(manager, "_cli_ref", None), "agent", None)
+def setting(key: str, default: Any = None) -> Any:
+    """One of this plugin's settings (``plugins.entries.<plugin>.settings``, see ``config_schema`` in
+    plugin.yaml); the default outside Hermes."""
+    if _ctx is None:
+        return default
+    try:
+        value = _ctx.get_config(key, default)
+    except Exception:
+        return default
+    return default if value in (None, "") else value
 
 
 def configure(home: Path) -> None:
@@ -86,8 +89,7 @@ def shutdown() -> None:
 
 def _asker(parent_agent):
     """A blocking question to the user through Hermes's own clarify surface, or None where nobody
-    can answer. Only used when the approval hook did not run (a direct call)."""
-    parent_agent = _agent(parent_agent)
+    can answer. ``parent_agent`` is the running agent Hermes passes to the tool."""
     callback = getattr(parent_agent, "clarify_callback", None) if parent_agent is not None else None
     if callback is None:
         return None
@@ -101,7 +103,7 @@ def _asker(parent_agent):
         # Hermes's own clarify tool through the public dispatch, with the agent's callback: the
         # same redacted prompt and answer every surface renders for the model's clarify calls.
         raw = _ctx.dispatch_tool("clarify", {"questions": [{"question": question, "choices": list(choices)}]},
-                                 callback=callback)
+                                 parent_agent=parent_agent, callback=callback)
         try:
             data = json.loads(raw)
             response = (data.get("responses") or [{}])[0]
@@ -116,27 +118,20 @@ def _asker(parent_agent):
 
 
 def _progress(parent_agent):
-    """A short status line the user sees while the chat runs (the CLI's status line), also published
-    as the plugin event ``progress`` for any surface that subscribes."""
-    agent = _agent(parent_agent)
-    emit = getattr(agent, "_emit_status", None) if agent is not None else None
+    """A short status line while the chat runs, published as the plugin event ``progress`` through
+    Hermes (``ctx.emit``) for any surface that subscribes, with the session it belongs to."""
+    session_id = getattr(parent_agent, "session_id", None) if parent_agent is not None else None
 
     def say(message: str) -> None:
         line = f"💬 support chat · {message}"
         if len(line) > 300:
             line = line[:297] + "…"
+        logger.info(line)
         if _ctx is not None:
             try:
-                _ctx.emit("progress", {"text": message})
+                _ctx.emit("progress", {"text": message, "line": line, "session_id": session_id})
             except Exception:
                 pass
-        if emit is not None:
-            try:
-                emit(line)
-                return
-            except Exception:
-                pass
-        logger.info(line)
 
     return say
 
@@ -176,91 +171,6 @@ def _session(session_id: str, parent_agent) -> ChatSession:
     return live
 
 
-# --- signing in ---------------------------------------------------------------------------------
-
-
-def _vault(handle: str):
-    """Hermes's own vault (``hermes vault add``, or 1Password/Bitwarden when connected): the
-    backend that owns ``handle``, or None. Hermes publishes no way for a plugin to read a vault login
-    (``ctx.register_login_backend`` only adds a backend), so this is a private import."""
-    from agent.vault_backends import backend_for_handle
-
-    return backend_for_handle(handle)
-
-
-def _redact(secret: str) -> None:
-    """Scrub the typed password from anything later shown to the model. Private import: the public
-    ``ctx.register_redaction_patterns`` would hold the password as a global regex across profiles and
-    log it whenever it rejects one."""
-    try:
-        from agent.redact import register_vault_redaction_value
-
-        register_vault_redaction_value(secret)
-    except Exception:
-        pass
-
-
-def sign_in(page, handle: str, parent_agent, progress) -> dict:
-    """Sign in on the chat's site with a login from Hermes's vault. The password is resolved here,
-    typed into the page and dropped: it never appears in a tool result, so never in the model's
-    context. A one-time code is asked of the user (or taken from the vault's TOTP seed) the same
-    way; a captcha is handed to the user in the visible browser window."""
-    try:
-        backend = _vault(handle)
-    except Exception as exc:
-        return {"signed_in": False, "error": f"Hermes's vault is unavailable here: {exc}"}
-    if backend is None:
-        return {"signed_in": False, "error": f"No vault login with handle {handle!r}. Call browser_vault_list for "
-                                             "handles; the user saves a login with `hermes vault add`."}
-    if getattr(backend, "needs_unlock", False) and not backend.is_unlocked():
-        return {"signed_in": False, "error": f"{backend.display_name} is locked; call browser_vault_unlock first."}
-    meta = backend.get_meta(handle)
-    if meta is None or meta.kind != "login":
-        return {"signed_in": False, "error": f"{handle!r} is not a saved login."}
-    here = page.origin()
-    allowed = {meta.origin, *getattr(meta, "allowed_origins", ())}
-    if here not in allowed:
-        return {"signed_in": False, "error": f"This login is saved for {meta.origin}, but the page is {here}; "
-                                             "it is only ever typed on its own site."}
-    if not page.password_visible():
-        return {"signed_in": True, "detail": "No sign-in form on the page (already signed in?)."}
-    progress(f"Signing in to {here} as {meta.identifier or 'the saved login'} (password from your vault)")
-    password = backend.resolve_password(handle)
-    _redact(password)
-    try:
-        typed = page.fill_login(meta.identifier or "", password)
-    finally:
-        password = None
-    if not typed:
-        return {"signed_in": False, "error": "Could not find the sign-in form's fields."}
-    ask = _asker(parent_agent)
-    if page.code_field_visible():
-        code = backend.resolve_otp(handle) if getattr(meta, "has_otp", False) else None
-        if code is None:
-            if ask is None:
-                return {"signed_in": False, "status": "needs_user",
-                        "error": "The site asks for a one-time code and nobody can be asked here."}
-            progress("The site sent you a sign-in code.")
-            code = ask(f"{here} asks for the sign-in code it just sent you. Type it here: it goes into the "
-                       "page, not into the conversation.", [])
-        if not code:
-            return {"signed_in": False, "status": "no_answer", "error": "No sign-in code, so not signed in."}
-        _redact(code)
-        page.fill_code(code)
-        code = None
-    if page.password_visible() or page.code_field_visible():
-        # A captcha or another check: the user finishes it in the browser window.
-        if ask is None:
-            return {"signed_in": False, "status": "needs_user",
-                    "error": "The sign-in needs a person (captcha or another check) and nobody can be asked here."}
-        answer = ask(f"{here} wants a check only you can do (a captcha or similar). Finish signing in in the "
-                     "Handle It browser window, then choose Done.", ["Done", "Cancel"])
-        if answer != "Done" or page.password_visible():
-            return {"signed_in": False, "status": "user_stopped", "error": "Sign-in was not finished."}
-    progress(f"Signed in to {here}.")
-    return {"signed_in": True, "origin": here, "as": meta.identifier}
-
-
 def _ok(data: dict) -> str:
     return json.dumps(data, ensure_ascii=False)
 
@@ -296,6 +206,8 @@ def start(args: dict, parent_agent=None, **_kw) -> str:
     progress = _progress(parent_agent)
     try:
         page = _get_browser().open(url)
+    except Refused as exc:
+        return _err(f"{exc} The chat browser only opens public web addresses; tell the user.")
     except BrowserUnavailable as exc:
         return _err(str(exc))
     except Exception as exc:
@@ -303,16 +215,10 @@ def start(args: dict, parent_agent=None, **_kw) -> str:
                     "yourself; tell the user.")
     progress(f"Opened {url}")
     before = page.text()
-    login = str(args.get("login") or "").strip()
-    if login:
-        signed = sign_in(page, login, parent_agent, progress)
-        if not signed.get("signed_in"):
-            page.close()
-            return _ok(signed)
     if not page.find_composer(open_chat=True):
         page.close()
         return _err("Opened the page but found no chat message box, even after trying a chat button. "
-                    "The chat may need a login or a pre-chat form; tell the user.")
+                    "The chat may need a login or a pre-chat form. " + SIGN_IN)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     session = ChatSession(page, url, task, {str(k): str(v) for k, v in shareable.items()},
                           [str(v) for v in never], folder=Path(), baseline=before)
@@ -376,8 +282,6 @@ def pre_tool_call(tool_name: str = "", args: Optional[dict] = None, **_kw):
     message = str(args.get("message") or "").strip()
     if not message:
         return None
-    if _asker(None) is not None:
-        return None  # the tool asks the user directly (CLI), whatever the approval mode
     try:
         session = _session(args.get("session_id"), None)
     except Exception:
@@ -417,6 +321,14 @@ def on_session_finalize(**_kw) -> None:
 
 # --- schemas ----------------------------------------------------------------------------------
 
+SIGN_IN = (
+    "When the chat needs the user signed in: this plugin shares Hermes's own browser when Hermes's "
+    "`browser.cdp_url` is set. Sign in there first with browser_navigate to the site's login page and "
+    "browser_vault (action fill, then enter_code if it asks for one), then call support_chat_start again. "
+    "Without `browser.cdp_url` the chat browser is separate and cannot use Hermes's logins; tell the user. "
+    "Never ask the user for a password."
+)
+
 START = {
     "name": "support_chat_start",
     "description": (
@@ -424,7 +336,8 @@ START = {
         "asks you to deal with customer service (a refund, a cancellation, a billing error, a missing parcel). "
         "Opens the page, finds the chat (clicking a chat button if needed) and waits for the first greeting. "
         "Then loop: read what support said, reply with support_chat_send, or keep holding with support_chat_wait "
-        "when they ask you to wait; there is no time limit. Every offer support makes is the user's call, even one that falls short of the goal: do not accept or turn it down yourself and never ask with clarify; reply with the acceptance you would send (e.g. 'Yes, I'll take the $36 partial refund', intent 'agree') and the plugin shows it to the user, who approves or declines it. If they decline, nothing is sent: keep working toward the goal. The same check runs on anything that pays, cancels, changes the account, or shares a detail not in `shareable`. End with support_chat_end and tell the user the outcome."
+        "when they ask you to wait; there is no time limit. Every offer support makes is the user's call, even one that falls short of the goal: do not accept or turn it down yourself and never ask with clarify; reply with the acceptance you would send (e.g. 'Yes, I'll take the $36 partial refund', intent 'agree') and the plugin shows it to the user, who approves or declines it. If they decline, nothing is sent: keep working toward the goal. The same check runs on anything that pays, cancels, changes the account, or shares a detail not in `shareable`. End with support_chat_end and tell the user the outcome. "
+        + SIGN_IN
     ),
     "parameters": {
         "type": "object",
@@ -437,7 +350,6 @@ START = {
                 "description": "Details the user allows you to share, label -> value, e.g. {\"order number\": \"1234\", \"name\": \"Sam Rivera\", \"email\": \"sam@example.com\"}. Anything else support asks for goes to the user first.",
             },
             "never_share": {"type": "array", "items": {"type": "string"}, "description": "Values that must never go into the chat (phone number, address...)."},
-            "login": {"type": "string", "description": "Handle of a saved login from browser_vault_list, when the chat needs the user signed in. The password is typed into the site's own sign-in form by the plugin; you never see it. Never ask the user for a password."},
             "max_wait_s": {"type": "number", "description": "How long to wait for the greeting, default 90."},
         },
         "required": ["url", "task"],

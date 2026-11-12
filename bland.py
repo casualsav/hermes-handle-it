@@ -1,13 +1,14 @@
 """A small client for bland.ai's call API (https://docs.bland.ai/api-v1/post/calls).
 
 Only the four calls a support call needs: place it, read it, stop it, and the account balance.
-The base URL can point at a stand-in (``demo/bland_standin.py``), which is how the tests run.
+The key is read through Hermes's profile-scoped secrets on every request; the base URL (the
+``bland_api_url`` setting) can point at a stand-in (``demo/bland_standin.py``), which is how the
+tests run.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import urllib.error
 import urllib.request
 from typing import Optional
@@ -19,18 +20,36 @@ class BlandError(RuntimeError):
     pass
 
 
+def _scoped_key() -> str:
+    """BLAND_API_KEY for the profile this turn serves (``agent.secret_scope``), never another's."""
+    try:
+        from agent.secret_scope import get_secret
+    except ImportError:  # outside Hermes
+        return ""
+    try:
+        return get_secret("BLAND_API_KEY") or ""
+    except Exception as exc:
+        raise BlandError(f"Could not read BLAND_API_KEY for this profile: {exc}") from None
+
+
 class Bland:
     def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None, timeout_s: float = 30.0) -> None:
-        self.key = api_key if api_key is not None else os.environ.get("BLAND_API_KEY", "")
-        self.base = (base_url or os.environ.get("BLAND_API_URL") or API).rstrip("/")
+        self._key = api_key
+        self.base = (base_url or API).rstrip("/")
         self.timeout = timeout_s
 
+    @property
+    def key(self) -> str:
+        return self._key if self._key is not None else _scoped_key()
+
     def _request(self, method: str, path: str, body: Optional[dict] = None) -> dict:
-        if not self.key:
-            raise BlandError("No bland.ai API key: set BLAND_API_KEY.")
+        key = self.key
+        if not key:
+            raise BlandError("No bland.ai API key: add BLAND_API_KEY with `hermes config set BLAND_API_KEY ...` "
+                             "or in this profile's .env.")
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.base + path, data=data, method=method,
-                                     headers={"authorization": self.key, "content-type": "application/json"})
+                                     headers={"authorization": key, "content-type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 return json.loads(resp.read() or b"{}")

@@ -11,7 +11,7 @@ offer, charge, cancellation or request for a detail it wasn't given comes back t
 
 | tool | does |
 |---|---|
-| `support_call_start` | places the call and follows it |
+| `support_call_start` | places the call once you approve it at Hermes's prompt, and follows it |
 | `support_call_wait` | keeps following it: new lines from the call, your approvals, the end of the call |
 | `support_call_end` | hangs up if still on the line, writes `transcript.md` with the outcome, the cost and the check |
 
@@ -33,8 +33,9 @@ does have is a custom tool, an HTTPS request it makes during the call. Each call
 4. If nobody can be asked or nobody answers, nothing is agreed. The agent says you will follow up
    and ends the call.
 
-The bridge listens on `127.0.0.1:$SUPPORT_CALL_BRIDGE_PORT` (default 8788). bland.ai has to reach
-it over public HTTPS, so set `SUPPORT_CALL_BRIDGE_URL` to a tunnel or reverse proxy that forwards
+The bridge listens on `127.0.0.1` at the plugin setting `call_bridge_port` (default 8788).
+bland.ai has to reach it over public HTTPS, so set the plugin setting `call_bridge_url`
+(`plugins.entries.hermes-handle-it.settings.call_bridge_url`) to a tunnel or reverse proxy that forwards
 to that port (for example `cloudflared tunnel --url http://127.0.0.1:8788`). Every request has to
 carry the call's own random bearer token, or the bridge answers 404.
 
@@ -57,12 +58,15 @@ $180. It calls the call's own tool exactly as bland.ai would.
 
 ```bash
 python -m pytest tests/test_phone.py
-python demo/bland_standin.py   # then BLAND_API_URL=http://127.0.0.1:8766 for a hand run
+python demo/bland_standin.py   # then set the plugin setting bland_api_url to http://127.0.0.1:8766 for a hand run
 ```
 
 ## What a real call needs
 
-- `BLAND_API_KEY`, a bland.ai API key.
+- `BLAND_API_KEY`, a bland.ai API key, in the Hermes profile's `.env`. Hermes reads it per profile
+  (`agent.secret_scope`), so one profile's key never places another profile's call.
+- Your yes to the call itself: Hermes asks before placing it, showing the number, the company, the
+  maximum minutes and whether it is recorded.
 - A public HTTPS address for the bridge (above). Without one, calls run but cannot accept offers.
 - Nothing else. Outbound calls go out from a bland.ai-owned caller ID unless you pass your own
   number, and no phone number has to be bought.

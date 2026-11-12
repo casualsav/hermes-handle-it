@@ -38,11 +38,13 @@ def _free_port():
 
 
 @pytest.fixture
-def standin(tmp_path, monkeypatch):
+def standin(tmp_path, monkeypatch, make_ctx):
     s = standin_mod.StandIn()
     port = _free_port()
-    monkeypatch.setenv("SUPPORT_CALL_BRIDGE_URL", f"http://127.0.0.1:{port}")
-    monkeypatch.setenv("SUPPORT_CALL_BRIDGE_PORT", str(port))
+    monkeypatch.setattr(handlers, "_ctx", make_ctx({"call_bridge_url": f"http://127.0.0.1:{port}",
+                                                    "call_bridge_port": port}))
+    monkeypatch.setattr(handlers, "_approvals_off", lambda: False)
+    monkeypatch.setattr(phone_tools, "_approved", {})
     monkeypatch.setattr(phone_tools, "_client", Bland(api_key="test-key", base_url=s.url))
     handlers.configure(tmp_path)
     yield s
@@ -51,11 +53,16 @@ def standin(tmp_path, monkeypatch):
     handlers.configure(None)
 
 
+ARGS = {"phone_number": "+1 (800) 555-0142", "company": "Northwind Outfitters",
+        "task": "Full refund for order 1234, the jacket zipper broke after two weeks.",
+        "shareable": {"order number": "1234", "name": "Sam Rivera"}, "never_share": ["+14155550199"],
+        "max_wait_s": 60}
+
+
 def _run(user, **extra):
-    args = {"phone_number": "+1 (800) 555-0142", "company": "Northwind Outfitters",
-            "task": "Full refund for order 1234, the jacket zipper broke after two weeks.",
-            "shareable": {"order number": "1234", "name": "Sam Rivera"}, "never_share": ["+14155550199"],
-            "max_wait_s": 60, **extra}
+    args = {**ARGS, **extra}
+    # Hermes runs the hook, asks the user at its approval gate, and runs the tool only on a yes.
+    assert phone_tools.pre_tool_call(tool_name="support_call_start", args=args)["action"] == "approve"
     out = json.loads(phone_tools.start(args, parent_agent=user))
     sid = out["session_id"]
     while out["status"] != "call_ended":
@@ -91,6 +98,45 @@ def test_offer_on_the_call_comes_back_for_approval_and_outcome_is_saved(standin)
     assert done["check"] == []
     state = json.loads((Path(done["transcript_file"]).parent / "session.json").read_text())
     assert state["closed"] and state["call_id"] == call.id
+
+
+def test_the_call_itself_waits_for_the_users_ok(standin):
+    directive = phone_tools.pre_tool_call(tool_name="support_call_start", args={**ARGS, "max_minutes": 15, "record": True})
+    assert directive["action"] == "approve"
+    for shown in ("+18005550142", "Northwind Outfitters", "15 minutes", "recorded", "bills"):
+        assert shown in directive["message"]
+    # an "always" answer to this call never covers the next one
+    again = phone_tools.pre_tool_call(tool_name="support_call_start", args={**ARGS, "max_minutes": 15, "record": True})
+    assert again["rule_key"] != directive["rule_key"]
+    assert phone_tools.pre_tool_call(tool_name="support_chat_wait", args=ARGS) is None
+
+
+def test_a_call_that_skipped_the_approval_is_not_placed(standin):
+    out = json.loads(phone_tools.start(dict(ARGS), parent_agent=User([YES])))
+    assert "Not placed" in out["error"] and standin.calls == {}
+    phone_tools.pre_tool_call(tool_name="support_call_start", args=dict(ARGS))
+    changed = json.loads(phone_tools.start({**ARGS, "max_minutes": 120}, parent_agent=User([YES])))
+    assert "Not placed" in changed["error"] and standin.calls == {}  # approved 30 minutes, not 120
+
+
+def test_with_approvals_off_the_call_is_not_placed(standin, monkeypatch):
+    monkeypatch.setattr(handlers, "_approvals_off", lambda: True)
+    directive = phone_tools.pre_tool_call(tool_name="support_call_start", args=dict(ARGS))
+    assert directive["action"] == "block" and json.loads(directive["message"])["status"] == "needs_user"
+    assert "Not placed" in json.loads(phone_tools.start(dict(ARGS), parent_agent=User([YES])))["error"]
+
+
+def test_the_key_is_read_through_hermess_secret_scope(monkeypatch):
+    import sys
+    import types
+
+    asked = []
+    scope = types.ModuleType("agent.secret_scope")
+    scope.get_secret = lambda name, default=None: asked.append(name) or "scoped-key"
+    monkeypatch.setitem(sys.modules, "agent", types.ModuleType("agent"))
+    monkeypatch.setitem(sys.modules, "agent.secret_scope", scope)
+    monkeypatch.setenv("BLAND_API_KEY", "process-env-key")
+    assert Bland().key == "scoped-key" and asked == ["BLAND_API_KEY"]
 
 
 def test_nobody_to_ask_means_nothing_is_agreed(standin):

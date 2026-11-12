@@ -6,8 +6,8 @@
 #   user.mp4   the user's side (Hermes's terminal), cropped from full.mp4
 #   markers.txt  seconds from the start of the recording for each step
 # The two crops come from one recording, so their timestamps line up exactly.
-# Needs Xvfb, tmux, ffmpeg, a Chromium, the plugin installed and enabled, and the demo login
-# saved in Hermes's vault (origin http://127.0.0.1:8765, sam@example.com / northwind-demo).
+# Needs Xvfb, tmux, ffmpeg, a Chromium and the plugin installed and enabled. The shop runs on
+# 127.0.0.1, so Hermes runs with its private-address opt-out (HERMES_ALLOW_PRIVATE_URLS=1).
 #
 #   demo/record/record.sh demo/raw
 #
@@ -26,7 +26,7 @@ SPEED=${SPEED:-0.6}
 DISP=${DISP:-:99}
 W=2240 H=940
 CHROME=${CHROME:-$(ls -d "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux*/chrome 2>/dev/null | sort -V | tail -1)}
-ASK="Northwind Outfitters' support chat is at http://127.0.0.1:${SHOP_PORT}/?login=1&speed=${SPEED} (sign in with my saved Northwind login). The zipper on my Ridgeline rain jacket broke after two weeks. Get me a full refund for order 1234. You can share the order number and my name, Sam Rivera."
+ASK="Northwind Outfitters' support chat is at http://127.0.0.1:${SHOP_PORT}/?speed=${SPEED}. The zipper on my Ridgeline rain jacket broke after two weeks. Get me a full refund for order 1234. You can share the order number and my name, Sam Rivera."
 TMP=$(mktemp -d)
 pids=()
 cleanup() {
@@ -40,7 +40,7 @@ Xvfb "$DISP" -screen 0 ${W}x${H}x24 >/dev/null 2>&1 & pids+=($!)
 sleep 1
 python3 "$HERE/../serve.py" --port "$SHOP_PORT" >/dev/null 2>&1 & pids+=($!)
 tmux new-session -d -s hsdemo -x 122 -y 54 \
-  "cd ~ && DISPLAY=$DISP AGENT_BROWSER_HEADED=1 hermes chat ${HERMES_ARGS:-}"
+  "cd ~ && DISPLAY=$DISP AGENT_BROWSER_HEADED=1 HERMES_ALLOW_PRIVATE_URLS=1 hermes chat ${HERMES_ARGS:-}"
 python3 "$HERE/term_mirror.py" hsdemo --port "$MIRROR_PORT" & pids+=($!)
 sleep 1
 DISPLAY=$DISP "$CHROME" --user-data-dir="$TMP/mirror" --no-sandbox --test-type --disable-infobars --no-first-run --disable-gpu \
