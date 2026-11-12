@@ -153,7 +153,10 @@
     await say("Hi, I'm " + AGENT + " from Northwind Outfitters support. How can I help today?", 1);
   }
 
-  if (!login) {
+  // A sign-in lasts for the browser session (a cookie), as on a real site: a chat opened again in
+  // the same browser, after signing in there, starts straight away.
+  const signedIn = document.cookie.split("; ").includes("northwind_signed_in=1");
+  if (!login || signedIn) {
     connect();
   } else {
     const form = document.getElementById("signin");
@@ -179,6 +182,7 @@
         err.textContent = "That code doesn't look right.";
         return;
       }
+      document.cookie = "northwind_signed_in=1; path=/; SameSite=Lax";
       form.hidden = true;
       log.hidden = false;
       document.getElementById("composer").hidden = false;

@@ -21,3 +21,24 @@ provides_hooks:
   - on_session_finalize
 python_dependencies:
   - "playwright>=1.40,<2"
+requires_env:
+  - name: BLAND_API_KEY
+    description: "Optional, for phone calls only: your bland.ai API key (leave empty to use support chats alone)"
+    url: "https://app.bland.ai"
+    secret: true
+config_schema:
+  bland_api_url:
+    type: str
+    default: "https://api.bland.ai"
+    description: "bland.ai API address (point it at demo/bland_standin.py to try calls without a real account)"
+    required: false
+  call_bridge_url:
+    type: str
+    default: ""
+    description: "Public HTTPS address (a tunnel or reverse proxy) that reaches the call approval bridge; empty means a call agrees to nothing and brings every offer back"
+    required: false
+  call_bridge_port:
+    type: int
+    default: 8788
+    description: "Local port the call approval bridge listens on (127.0.0.1)"
+    required: false

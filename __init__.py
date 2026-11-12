@@ -31,5 +31,6 @@ def register(ctx) -> None:
             emoji=emoji,
         )
     ctx.register_hook("pre_tool_call", handlers.pre_tool_call)
+    ctx.register_hook("pre_tool_call", phone_tools.pre_tool_call)
     ctx.register_hook("on_session_finalize", handlers.on_session_finalize)
     ctx.register_hook("on_session_finalize", lambda **_kw: phone_tools.shutdown())

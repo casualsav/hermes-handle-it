@@ -7,7 +7,7 @@ down, the full $180. Whenever the script reaches an offer it calls the call's ow
 ``CheckWithAccountHolder`` tool (its URL, headers and body template, as bland.ai would), and
 keeps the support person holding while the answer is ``pending``.
 
-    python demo/bland_standin.py            # http://127.0.0.1:8766, then BLAND_API_URL=http://127.0.0.1:8766
+    python demo/bland_standin.py            # http://127.0.0.1:8766: set the plugin setting bland_api_url to it
 """
 
 from __future__ import annotations
@@ -198,7 +198,7 @@ class StandIn:
 
 if __name__ == "__main__":
     s = StandIn(port=int(sys.argv[1]) if len(sys.argv) > 1 else 8766, step_s=1.5)
-    print(f"bland.ai stand-in on {s.url}  (BLAND_API_URL={s.url})", flush=True)
+    print(f"bland.ai stand-in on {s.url}  (plugin setting bland_api_url: {s.url})", flush=True)
     try:
         threading.Event().wait()
     except KeyboardInterrupt:
