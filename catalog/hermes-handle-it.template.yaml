@@ -1,6 +1,9 @@
+# Template for this plugin's entry in the Hermes plugin catalog, not the live entry.
+# The live entry, with the release commit's real sha, is the one in the catalog's pull request:
+# a commit cannot carry its own sha, so this copy never holds one.
 name: hermes-handle-it
 repo: https://github.com/casualsav/hermes-handle-it
-sha: 0000000000000000000000000000000000000000
+sha: "<release commit sha, filled in the catalog pull request>"
 description: "Handle It: your agent sits in the customer support chat so you don't have to. Hermes holds a company's live customer-support
   chat for you in its own browser, negotiates toward your goal for as long as it takes, and asks
   you before it agrees to an offer, pays, cancels or shares a detail you did not allow. Ends with
