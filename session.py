@@ -28,6 +28,8 @@ STOP = "Stop the chat"
 ACCEPT_OFFER = "Accept the offer"
 DECLINE_OFFER = "Turn it down: keep negotiating"
 HOLD = "One moment please, I'm checking with the account holder."
+FOLLOW_UP = ("Thank you for your patience. The account holder has stepped away and can't confirm right now, "
+             "so they will follow up with you directly.")
 QUIET_S = 3.0  # a reply counts once the support side has been quiet this long
 HEARTBEAT_S = 60.0  # how often a long wait tells the user it is still holding
 
@@ -226,6 +228,7 @@ class ChatSession:
             return "", ""
         blocked = self.guard.hard_block(message)
         if blocked:
+            self.pending = None
             return "block", ("Not sent: " + _reasons(blocked) + ". Card details are never typed into a chat; tell "
                              "support the account holder will pay themselves, and tell the user.")
         findings = self.guard.check(message, intent)
@@ -242,6 +245,28 @@ class ChatSession:
         self.progress("Waiting for your OK before replying.")
         self.save()
         return "ask", _question(last, message, findings)
+
+    def approval_refused(self, message: str, reason: str) -> Optional[str]:
+        """Hermes's gate did not let ``message`` through (it runs after the hook, so only the block
+        tells us). A no keeps the chat going; no answer ends it the way a call does: support hears the
+        account holder will follow up, and nothing is agreed. Returns "declined", "no_answer" or None."""
+        if self.pending is None or self.pending != message:
+            return None
+        self.pending = None
+        if "denied" in reason.lower():
+            self.approvals.append({"asked": message, "answer": "declined"})
+            self.turns.append(Turn("note", "You declined this reply; it was not sent."))
+            self.save()
+            return "declined"
+        self.approvals.append({"asked": message, "answer": None})
+        self.turns.append(Turn("note", "No answer to the approval; told support you will follow up."))
+        try:
+            self._type(FOLLOW_UP)
+        except Exception:
+            pass
+        self.finish(f"Nobody answered the approval for: \"{message}\". Support was told the account holder "
+                    "will follow up; nothing was agreed.", resolved=False)
+        return "no_answer"
 
     def open_offer(self) -> Optional[str]:
         """Support's latest offer since our last reply (our hold line does not answer it)."""
