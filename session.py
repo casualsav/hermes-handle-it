@@ -249,15 +249,18 @@ class ChatSession:
     def approval_refused(self, message: str, reason: str) -> Optional[str]:
         """Hermes's gate did not let ``message`` through (it runs after the hook, so only the block
         tells us). A no keeps the chat going; no answer ends it the way a call does: support hears the
-        account holder will follow up, and nothing is agreed. Returns "declined", "no_answer" or None."""
+        account holder will follow up, and nothing is agreed. Any other block only forgets the reply.
+        Returns "declined", "blocked", "no_answer" or None."""
         if self.pending is None or self.pending != message:
             return None
         self.pending = None
-        if "denied" in reason.lower():
-            self.approvals.append({"asked": message, "answer": "declined"})
-            self.turns.append(Turn("note", "You declined this reply; it was not sent."))
+        if "timed out" not in reason.lower():
+            declined = "denied" in reason.lower()
+            self.approvals.append({"asked": message, "answer": "declined" if declined else "blocked"})
+            self.turns.append(Turn("note", "You declined this reply; it was not sent." if declined
+                                   else "Hermes blocked this reply; it was not sent."))
             self.save()
-            return "declined"
+            return "declined" if declined else "blocked"
         self.approvals.append({"asked": message, "answer": None})
         self.turns.append(Turn("note", "No answer to the approval; told support you will follow up."))
         try:

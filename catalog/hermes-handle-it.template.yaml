@@ -35,6 +35,7 @@ capabilities:
     - support_call_end
   provides_hooks:
     - pre_tool_call
+    - post_tool_call
     - on_session_finalize
   provides_middleware: []
   requires_env:

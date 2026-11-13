@@ -119,7 +119,7 @@ How it reads any chat: it compares the visible text of the page and all its fram
 The conversation loop (`session.py`) talks to a *channel* with five methods: `text()`, `send()`, `find_composer()`, `screenshot()`, `close()`. The browser page (`browser.py`) is the one channel today; a phone channel through a calling plugin could implement the same five and reuse the loop, the guard and the approvals unchanged.
 
 ```
-__init__.py   register(): seven tools, the pre_tool_call approval hook, on_session_finalize
+__init__.py   register(): seven tools, the pre_tool_call approval hook, the post_tool_call hook that closes a chat on an unanswered card, on_session_finalize
 handlers.py   tool schemas and handlers, reaching the user (approval, progress)
 session.py    the loop: wait for replies, gate every message, save state, transcript
 guard.py      what needs the user's OK: details not allowed, commitments, card numbers

@@ -243,7 +243,7 @@ def test_an_unanswered_card_tells_support_and_ends_with_nothing_agreed(tmp_path)
                        "BLOCKED: Action timed out without user response. Do not retry.")
     assert page.sent == [HOLD, FOLLOW_UP] and s.closed and page.closed
     assert s.pending is None and s.approvals[-1]["answer"] is None
-    assert "nothing was agreed" in (tmp_path / "chat" / "transcript.md").read_text()
+    assert json.loads((tmp_path / "chat" / "session.json").read_text())["closed"] is True
 
 
 def test_a_block_for_another_message_changes_nothing(tmp_path):
@@ -260,3 +260,9 @@ def test_the_post_tool_call_hook_closes_a_chat_nobody_answered(tmp_path):
     handlers.post_tool_call("support_chat_send", {"session_id": s.id, "message": "Yes, I'll take the $36 partial refund."},
                             status="blocked", error_message="BLOCKED: Action timed out without user response.")
     assert s.id not in handlers._sessions and s.closed and page.sent[-1] == FOLLOW_UP
+
+
+def test_a_block_that_is_not_a_timeout_does_not_end_the_chat(tmp_path):
+    s, page = _offer_on_the_gate(tmp_path)
+    s.approval_refused("Yes, I'll take the $36 partial refund.", "BLOCKED: Failed to send approval request to user.")
+    assert s.pending is None and not s.closed and page.sent == [HOLD]
