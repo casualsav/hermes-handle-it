@@ -2,7 +2,7 @@
 
 import json
 
-from support_chat_plugin.session import ACCEPT_OFFER, APPROVE, DECLINE_OFFER, DENY, HOLD, ChatSession
+from support_chat_plugin.session import ACCEPT_OFFER, APPROVE, DECLINE_OFFER, DENY, FOLLOW_UP, HOLD, ChatSession
 
 
 class Clock:
@@ -218,3 +218,51 @@ def test_statement_offer_asks_the_user_on_a_direct_call(tmp_path):
     out = s.send("Yes, that works", intent="inform", ask=lambda q, choices: asked.append(q) or DECLINE_OFFER)
     assert asked and "$36 store credit" in asked[0]
     assert "Yes, that works" not in page.sent and out["status"] == "user_declined_offer"
+
+
+def _offer_on_the_gate(tmp_path):
+    s, page, clock = session(tmp_path, {})
+    s.wait_for_reply()
+    page.lines += ["Dana", "I can offer a 20% partial refund ($36). Would that work for you?"]
+    s.wait_for_reply()
+    assert s.before_approval("Yes, I'll take the $36 partial refund.", "agree")[0] == "ask"
+    return s, page
+
+
+def test_a_declined_card_is_asked_again_not_sent(tmp_path):
+    s, page = _offer_on_the_gate(tmp_path)
+    s.approval_refused("Yes, I'll take the $36 partial refund.", "BLOCKED: Action denied by user.")
+    out = s.send("Yes, I'll take the $36 partial refund.", intent="agree", ask=None)
+    assert out["status"] == "needs_user"
+    assert "Yes, I'll take the $36 partial refund." not in page.sent and not s.closed
+
+
+def test_an_unanswered_card_tells_support_and_ends_with_nothing_agreed(tmp_path):
+    s, page = _offer_on_the_gate(tmp_path)
+    s.approval_refused("Yes, I'll take the $36 partial refund.",
+                       "BLOCKED: Action timed out without user response. Do not retry.")
+    assert page.sent == [HOLD, FOLLOW_UP] and s.closed and page.closed
+    assert s.pending is None and s.approvals[-1]["answer"] is None
+    assert json.loads((tmp_path / "chat" / "session.json").read_text())["closed"] is True
+
+
+def test_a_block_for_another_message_changes_nothing(tmp_path):
+    s, page = _offer_on_the_gate(tmp_path)
+    s.approval_refused("Something else.", "BLOCKED: Action timed out without user response.")
+    assert s.pending == "Yes, I'll take the $36 partial refund." and not s.closed
+
+
+def test_the_post_tool_call_hook_closes_a_chat_nobody_answered(tmp_path):
+    from support_chat_plugin import handlers
+
+    s, page = _offer_on_the_gate(tmp_path)
+    handlers._sessions[s.id] = s
+    handlers.post_tool_call("support_chat_send", {"session_id": s.id, "message": "Yes, I'll take the $36 partial refund."},
+                            status="blocked", error_message="BLOCKED: Action timed out without user response.")
+    assert s.id not in handlers._sessions and s.closed and page.sent[-1] == FOLLOW_UP
+
+
+def test_a_block_that_is_not_a_timeout_does_not_end_the_chat(tmp_path):
+    s, page = _offer_on_the_gate(tmp_path)
+    s.approval_refused("Yes, I'll take the $36 partial refund.", "BLOCKED: Failed to send approval request to user.")
+    assert s.pending is None and not s.closed and page.sent == [HOLD]

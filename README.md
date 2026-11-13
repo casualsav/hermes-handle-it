@@ -109,8 +109,8 @@ Recording (`record: true`) keeps bland.ai's recording of the call, and the agent
 
 ## What it has been tried on
 
-- **Tried:** the demo shop above, end to end in Hermes Agent 0.21.5 on Linux (arm64) with DeepSeek as the model, in the CLI; in tests, the chat inside the page, the same chat inside an iframe behind a "Chat with us" launcher (the shape of Intercom, Zendesk and similar widgets), a sign-in made in the browser at `browser.cdp_url` carrying into the chat, and redirects and frames into private and metadata addresses being stopped before they load. Unit tests cover the guard (including an offer stated without a question, and a reply that takes it without saying "agree"), the reader, the waiting loop, approvals and restart.
-- **Not tried yet:** a real company's live chat (it would mean talking to real people at a real company; real widgets add cookie banners, pre-chat forms, canvas and closed shadow DOM), the approval card on a messaging gateway such as Telegram (the hook returns Hermes's standard `approve` action, but no gateway run has shown the card arriving), macOS, a sign-in with `browser_vault` end to end in a Hermes session with a model, and chats that require a pre-chat form first (`support_chat_start` reports that it found no message box).
+- **Tried:** the demo shop above, end to end in Hermes Agent 0.21.5 on Linux (arm64) with DeepSeek as the model, in the CLI; on a Telegram gateway (Hermes Agent 0.23.1), where each acceptance arrived as Hermes's approval card with its buttons: one approved and sent, one left unanswered that timed out with nothing sent; in tests, the chat inside the page, the same chat inside an iframe behind a "Chat with us" launcher (the shape of Intercom, Zendesk and similar widgets), a sign-in made in the browser at `browser.cdp_url` carrying into the chat, and redirects and frames into private and metadata addresses being stopped before they load. Unit tests cover the guard (including an offer stated without a question, and a reply that takes it without saying "agree"), the reader, the waiting loop, approvals and restart.
+- **Not tried yet:** a real company's live chat (it would mean talking to real people at a real company; real widgets add cookie banners, pre-chat forms, canvas and closed shadow DOM), macOS, a sign-in with `browser_vault` end to end in a Hermes session with a model, and chats that require a pre-chat form first (`support_chat_start` reports that it found no message box).
 
 How it reads any chat: it compares the visible text of the page and all its frames between polls, so it needs no per-site code; it finds the message box by its role and label, and presses Enter or the Send button. Widgets that draw messages on a canvas or in closed shadow DOM would need more.
 
@@ -119,7 +119,7 @@ How it reads any chat: it compares the visible text of the page and all its fram
 The conversation loop (`session.py`) talks to a *channel* with five methods: `text()`, `send()`, `find_composer()`, `screenshot()`, `close()`. The browser page (`browser.py`) is the one channel today; a phone channel through a calling plugin could implement the same five and reuse the loop, the guard and the approvals unchanged.
 
 ```
-__init__.py   register(): seven tools, the pre_tool_call approval hook, on_session_finalize
+__init__.py   register(): seven tools, the pre_tool_call approval hook, the post_tool_call hook that closes a chat on an unanswered card, on_session_finalize
 handlers.py   tool schemas and handlers, reaching the user (approval, progress)
 session.py    the loop: wait for replies, gate every message, save state, transcript
 guard.py      what needs the user's OK: details not allowed, commitments, card numbers

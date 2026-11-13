@@ -314,6 +314,27 @@ def _approvals_off() -> bool:
     return mode is False or str(mode).strip().lower() in ("off", "false", "never", "yolo", "none")
 
 
+def post_tool_call(tool_name: str = "", args: Optional[dict] = None, status: str = "", error_message: str = "",
+                   **_kw) -> None:
+    """Hermes's gate blocked a reply the hook sent for approval: forget it, so only a fresh yes sends
+    it, and when nobody answered, close the chat with a word to support."""
+    if tool_name != "support_chat_send" or status != "blocked" or not isinstance(args, dict):
+        return
+    sid = re.sub(r"[^a-f0-9]", "", str(args.get("session_id") or ""))
+    with _lock:
+        session = _sessions.get(sid)
+    if session is None:
+        return
+    outcome = session.approval_refused(str(args.get("message") or "").strip(), str(error_message or ""))
+    if outcome == "no_answer":
+        with _lock:
+            _sessions.pop(sid, None)
+        session.progress("No answer came, so I told support you will follow up and closed the chat. "
+                         "Nothing was agreed.")
+    elif outcome == "declined":
+        session.progress("You declined; nothing was sent.")
+
+
 def on_session_finalize(**_kw) -> None:
     """Save open chats and close the browser when the Hermes session closes; they resume on the next call."""
     shutdown()
@@ -336,7 +357,7 @@ START = {
         "asks you to deal with customer service (a refund, a cancellation, a billing error, a missing parcel). "
         "Opens the page, finds the chat (clicking a chat button if needed) and waits for the first greeting. "
         "Then loop: read what support said, reply with support_chat_send, or keep holding with support_chat_wait "
-        "when they ask you to wait; there is no time limit. Every offer support makes is the user's call, even one that falls short of the goal: do not accept or turn it down yourself and never ask with clarify; reply with the acceptance you would send (e.g. 'Yes, I'll take the $36 partial refund', intent 'agree') and the plugin shows it to the user, who approves or declines it. If they decline, nothing is sent: keep working toward the goal. The same check runs on anything that pays, cancels, changes the account, or shares a detail not in `shareable`. End with support_chat_end and tell the user the outcome. "
+        "when they ask you to wait; there is no time limit. Every offer support makes is the user's call, even one that falls short of the goal: do not accept or turn it down yourself and never ask with clarify; reply with the acceptance you would send (e.g. 'Yes, I'll take the $36 partial refund', intent 'agree') and the plugin shows it to the user, who approves or declines it. If they decline, nothing is sent: keep working toward the goal. If nobody answers, nothing is sent either: the plugin tells support the user will follow up and closes the chat, so tell the user that. The same check runs on anything that pays, cancels, changes the account, or shares a detail not in `shareable`. End with support_chat_end and tell the user the outcome. "
         + SIGN_IN
     ),
     "parameters": {
