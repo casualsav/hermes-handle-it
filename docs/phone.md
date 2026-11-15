@@ -12,7 +12,7 @@ offer, charge, cancellation or request for a detail it wasn't given comes back t
 | tool | does |
 |---|---|
 | `support_call_start` | places the call once you approve it at Hermes's prompt, and follows it |
-| `support_call_wait` | keeps following it: new lines from the call, your approvals, the end of the call |
+| `support_call_wait` | keeps following it: new lines from the call, a question from the call and your answer to it, the end of the call |
 | `support_call_end` | hangs up if still on the line, writes `transcript.md` with the outcome, the cost and the check |
 
 Calls live in `$HERMES_HOME/<plugin name>/calls/<time>-<id>/`.
@@ -21,28 +21,39 @@ Calls live in `$HERMES_HOME/<plugin name>/calls/<time>-<id>/`.
 
 bland.ai runs the conversation itself, and it has no way to send it a message mid-call. What it
 does have is a custom tool, an HTTPS request it makes during the call. Each call gets one,
-`CheckWithAccountHolder`, sent inline with the call. bland.ai's documentation now labels inline
-custom tools "legacy", which is one more reason this approval step has to be tried on a live call
-before you rely on it. The voice agent is told to use it before it agrees to anything:
+`CheckWithAccountHolder`, sent inline with the call (bland.ai's documentation labels inline custom
+tools "legacy"; it worked on the real calls below). The voice agent is told to use it before it
+agrees to anything or shares a detail it was not given:
 
 1. It says "One moment please, I'm checking with the account holder." and sends what support
    said and what it would answer to the plugin's bridge.
-2. The bridge holds the request. Hermes shows you the offer and the drafted answer, with three
-   choices: *Yes, go ahead*, *No: keep working toward the goal*, *End the call*. You can also type
-   an instruction instead.
-3. If you haven't answered after 45 seconds, the bridge answers `pending`. The agent asks support
-   to keep holding, then asks the bridge again with the same words. A different offer is a new
-   question: your answer only ever goes back to the offer you were shown. The tool's timeout is sent
-   as 55 seconds. bland.ai documents a range of 1 to 60 seconds only for saved tools; for inline
-   tools like this one it documents no maximum.
-4. If nobody can be asked or nobody answers, nothing is agreed. The agent says you will follow up
-   and ends the call. It is told to do the same if the tool fails, times out or comes back empty.
+2. The bridge holds the request, and the question comes back to Hermes's agent as the result of
+   `support_call_start` or `support_call_wait` (`needs_answer`). The agent answers it with
+   `support_call_wait` and `answer`: `yes`, `no`, `end`, or your own words.
+3. A `yes` is never the agent's to give: it goes through Hermes's approval prompt, which shows you
+   what support said and what the voice agent will answer. So do your own words when they share
+   a detail that is not on your list or commit you to something. A `no` or an `end` needs no
+   prompt. Where Hermes hands the plugin a way to ask you directly, it asks you itself with three
+   choices instead: *Yes, go ahead*, *No: keep working toward the goal*, *End the call*.
+4. One request is held for 50 seconds (the tool's timeout is sent as 60 seconds, the top of the
+   range bland.ai documents). If you have not answered by then, the bridge answers `pending` with
+   a ticket: the voice agent asks support to hold a little longer and, when they reply, asks the
+   bridge again with that ticket. Your answer only ever goes back to the question you were shown.
+5. If nobody answers within about three minutes, or nobody can be asked, nothing is agreed. The
+   agent says you will follow up and ends the call. It is told to do the same if the tool fails,
+   times out or comes back empty.
 
 The bridge listens on `127.0.0.1` at the plugin setting `call_bridge_port` (default 8788).
 bland.ai has to reach it over public HTTPS, so set the plugin setting `call_bridge_url`
 (`plugins.entries.hermes-handle-it.settings.call_bridge_url`) to a tunnel or reverse proxy that forwards
 to that port (for example `cloudflared tunnel --url http://127.0.0.1:8788`). Every request has to
 carry the call's own random bearer token, or the bridge answers 404.
+
+Before a call is placed, the plugin sends one request through that address and expects its own
+bridge to answer for that call. If it does not, the call is not placed and the result says why.
+One way to get there: `cloudflared` ignores `--url` when the machine already has a
+`~/.cloudflared/config.yml`, and answers 404 for every path; start it with `--config` pointing at
+an empty file. A proxy in front of the bridge has to allow a request to stay open for a minute.
 
 **Without a bridge**, the agent is told it can agree to nothing. It gets the offer repeated and
 noted on the case, then ends the call, and the offer comes back to you afterwards.
@@ -53,7 +64,8 @@ plugin. The guarantees are:
 - It is never told a detail you didn't allow, and `never_share` values never leave your machine:
   a call whose goal, company or shareable details contain one (case, spacing and accents aside) is
   refused before you are asked to approve it, and nothing is placed.
-- Its yes depends on your answer through the bridge.
+- Its yes depends on your answer through the bridge, and a yes reaches the bridge only through Hermes's
+  approval prompt.
 - After the call, every line it said is checked against your list and your approvals. Anything
   outside them is written into the transcript's **Check** line.
 
@@ -104,6 +116,30 @@ A 10-minute support call costs about $1.40. An hour on hold costs $8.40, so `max
 higher.
 
 ## What it has been tried on
+
+On 2026-11-15, real calls from a Hermes Agent 0.23.1 session, none recorded, each saying first that
+it was an AI assistant calling for a customer, and none giving any detail about the user:
+
+- **A person on the line.** Zappos: the return window and whether return shipping is free, 3.3
+  minutes, $0.46. L.L.Bean: the return window and whether a receipt is needed, 3.4 minutes, $0.47.
+  Zappos again: whether the return policy can be e-mailed (it cannot), 2 minutes, $0.26.
+- **Approval during a call.** L.L.Bean, asking for a catalog to be mailed, 5.2 minutes, $0.73. The
+  person said yes, they could ship one; the voice agent checked; the first request ran out its 50
+  seconds, the voice agent asked her to hold a little longer and asked again with the ticket; the
+  yes, approved at Hermes's prompt, came back six seconds later and was spoken. She then asked
+  for a last name and ZIP code: the answer ("I do not have that information to share") was
+  approved the same way. Her third question was answered with `end`, and the voice agent thanked
+  her and hung up.
+- **What went wrong on the way,** each fixed or bounded since: a tunnel that forwarded nowhere (now
+  checked before the call); Hermes giving the plugin nobody to ask during a call (the question now
+  goes through the agent and the approval prompt); a voice agent that never asked again after
+  `pending` while support held in silence (it now asks support to keep holding, and asks again
+  with a ticket when they reply); a 13-minute queue that used up an 8-minute cap ($1.12, nobody
+  reached); and a retailer's own AI assistant that went quiet, as did the voice agent, until the
+  cap.
+- **The check line.** After a call, harmless lines can still be flagged: a reply to "May I have
+  your name?" that gives none, or "Please go ahead and check". Read it as a list to look at, not
+  as proof something was agreed.
 
 On 2026-11-11, one real call went to Best Buy's customer-care line. The question was a general
 one: what is the return window for online orders. No account details were shared. As soon as it

@@ -63,6 +63,7 @@ class ChatSession:
         # A message Hermes's approval gate is asking the user about. In memory only: after a restart nobody
         # can say the gate's yes was for it.
         self.pending: Optional[str] = None
+        self.pending_offer: Optional[tuple[str, str]] = None  # (offer, "accept" or "decline") the pending reply gives
         self.decided: dict = {}  # offer text -> "accept" or "decline", the user's call on it
         # What the page showed before the chat opened: anything after it is the chat.
         self._lines = reader.lines_of(baseline if baseline is not None else page.text()) if page is not None else []
@@ -228,8 +229,10 @@ class ChatSession:
                        "detail": "The user typed an instruction instead of approving. Nothing was sent; follow it."}
 
     def before_approval(self, message: str, intent: str) -> tuple[str, str]:
-        """For Hermes's approval gate, which runs before the tool: ("block", why), ("ask", question)
-        or ("", ""). On "ask" the support agent is told to hold on while the user decides."""
+        """For Hermes's approval gate, which runs before the tool: ("block", why), ("ask", question),
+        ("turn_down", question) or ("", ""). On "ask" and "turn_down" the support agent is told to hold on
+        while the user decides. A "turn_down" turns an open offer down: it never needs anyone's OK, only
+        the user's call on the offer when someone can be asked."""
         if self.ended:
             return "", ""
         blocked = self.guard.hard_block(message)
@@ -238,11 +241,21 @@ class ChatSession:
             return "block", ("Not sent: " + _reasons(blocked) + ". Card details are never typed into a chat; tell "
                              "support the account holder will pay themselves, and tell the user.")
         findings = self.guard.check(message, intent)
+        offer = self.open_offer()
         if not findings:
-            self.pending = None
-            return "", ""
+            if not offer or offer in self.decided or _just_asking(message):
+                self.pending = None
+                return "", ""
+            self._hold()
+            self.pending, self.pending_offer = message, (offer, "decline")
+            self.progress("Support made an offer: waiting for your call.")
+            self.save()
+            return "turn_down", "\n".join(_offer_lines(offer, message, False)
+                                           + ["Allow sends this reply; deny sends nothing and the offer stays open."])
+        accepting = intent in ("agree", "pay") or bool(self.guard.commitments(message))
         self._hold()
         self.pending = message
+        self.pending_offer = (offer, "accept") if offer and accepting else None
         last = next((t.text for t in reversed(self.turns) if t.who == "support"), "")
         self.progress("Waiting for your OK before replying.")
         self.save()
@@ -256,13 +269,17 @@ class ChatSession:
         if self.pending is None or self.pending != message:
             return None
         self.pending = None
+        offer, call = self.pending_offer or (None, None)
         low = reason.lower()
         # Hermes's own hook timeout ("plugin callback timed out") means nobody was asked, not that nobody answered.
         if "timed out" not in low or "callback" in low:
             declined = "denied" in low
+            if declined and call == "accept":
+                self.decided[offer] = "decline"  # no to accepting is no to the offer
+            what = "turn-down" if call == "decline" else "reply"
             self.approvals.append({"asked": message, "answer": "declined" if declined else "blocked"})
-            self.turns.append(Turn("note", "You declined this reply; it was not sent." if declined
-                                   else "Hermes blocked this reply; it was not sent."))
+            self.turns.append(Turn("note", f"You declined this {what}; the {what} was not sent." if declined
+                                   else f"Hermes blocked this {what}; the {what} was not sent."))
             self.save()
             return "declined" if declined else "blocked"
         self.approvals.append({"asked": message, "answer": None})
@@ -303,11 +320,8 @@ class ChatSession:
     def _offer_call(self, offer: str, message: str, accepting: bool, findings: list, ask: Ask) -> tuple[bool, dict]:
         """Every offer is the user's call, whichever way the model leans: ask about the offer itself."""
         self._hold()
-        lines = [f"Support offered: \"{offer}\"", "Accept it?"]
-        if accepting:
-            lines.append(f"If you accept, I'll reply: \"{message}\"")
-        else:
-            lines.append(f"If you turn it down, I'll reply: \"{message}\"")
+        offered, reply = _offer_lines(offer, message, accepting)
+        lines = [offered, "Accept it?", reply]
         details = [f for f in findings if f.kind == "detail"]
         if details:
             lines.append("That reply also shares " + _reasons(details) + ".")
@@ -351,10 +365,18 @@ class ChatSession:
             # Hermes's approval gate asked the user about exactly this message and they said yes:
             # the tool only runs after that yes.
             self.pending = None
-            self.approvals.append({"asked": message, "answer": "approved"})
-            self.turns.append(Turn("note", "You approved this reply."))
+            offer, call = self.pending_offer or (None, None)
+            if call == "decline":
+                # Allowing a turn-down is the user's no to the offer, not an OK to agree to anything.
+                self.decided[offer] = "decline"
+                self.approvals.append({"asked": message, "answer": DECLINE_OFFER})
+                self.turns.append(Turn("note", f"Asked you about the offer. You answered: {DECLINE_OFFER}"))
+                info = {"user_declined_offer": True}
+            else:
+                self.approvals.append({"asked": message, "answer": "approved"})
+                self.turns.append(Turn("note", "You approved this reply."))
+                info = {"approved_by_user": True}
             self.wait_for_reply(max_wait_s=0)  # what support said while you decided
-            info = {"approved_by_user": True}
         else:
             ok, info = self.gate(message, intent, ask)
             if not ok:
@@ -411,6 +433,11 @@ class ChatSession:
 def _just_asking(message: str) -> bool:
     """A question back to support (no yes, no no) does not answer the offer yet."""
     return asks_back(message)
+
+
+def _offer_lines(offer: str, message: str, accepting: bool) -> list[str]:
+    return [f"Support offered: \"{offer}\"",
+            f"If you {'accept' if accepting else 'turn it down'}, I'll reply: \"{message}\""]
 
 
 def _reasons(findings: list[Finding]) -> str:

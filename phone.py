@@ -14,10 +14,14 @@ and ends the call, and the offer comes back to the user afterwards.
 
 from __future__ import annotations
 
+import http.client
 import json
+import re
 import secrets
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,26 +29,32 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .bland import Bland
-from .guard import Guard, _norm
+from .guard import Guard, _norm, asks_back
 from .session import HOLD, Ask, Progress, Turn, _nothing
 
 YES = "Yes, go ahead"
 NO = "No: keep working toward the goal"
 END_CALL = "End the call"
 # bland.ai documents a 1-60 s timeout range only for saved tools; for the inline tool sent here no
-# maximum is documented, so answer "pending" well inside 60 s
-HOLD_S = 45.0
+# maximum is documented. The tool's timeout is derived from HOLD_S: these two constants are the place to change.
+HOLD_S = 50.0
 POLL_S = 3.0
 SETTLE_S = 45.0  # how long to wait for the price and summary after the call ends
+# How long a question with nobody to ask directly may wait for the model to bring back the user's answer before
+# support is told the account holder will follow up: the voice agent asks again every HOLD_S meanwhile.
+ANSWER_S = 170.0  # longer than one hold
 READ_FAILURES = 5  # reads of the call failing in a row before following it stops: a revoked key or an outage
 TOOL = "CheckWithAccountHolder"
+PING_TIMEOUT_S = 10.0
+PING_RETRY_S = 2.0  # a tunnel that was just started may need a moment
 WHO = {"user": "support", "assistant": "you"}
 
 
 class CallSession:
     def __init__(self, phone_number: str, company: str, task: str, allowed: dict, private: list, folder: Path,
                  max_minutes: int = 30, record: bool = False, session_id: Optional[str] = None, clock: Callable[[], float] = time.monotonic,
-                 sleep: Callable[[float], None] = time.sleep, poll_s: float = POLL_S, hold_s: float = HOLD_S) -> None:
+                 sleep: Callable[[float], None] = time.sleep, poll_s: float = POLL_S, hold_s: float = HOLD_S,
+                 urlopen: Callable = urllib.request.urlopen) -> None:
         self.id = session_id or uuid.uuid4().hex[:8]
         self.phone_number = phone_number
         self.company = company
@@ -67,6 +77,7 @@ class CallSession:
         self._read_failures = 0
         self._read_error = ""
         self._clock, self._sleep, self._poll, self._hold = clock, sleep, poll_s, hold_s
+        self._urlopen = urlopen
         self._cv = threading.Condition()
 
     # --- the call's instructions ---------------------------------------------------------
@@ -99,11 +110,12 @@ class CallSession:
                 "- accepted: say yes in the words you proposed and confirm the details;",
                 "- declined: politely turn it down and keep working toward the goal;",
                 "- instruction: follow the account holder's instruction;",
-                f"- pending: tell them you are still checking with the account holder, thank them for holding, "
-                f"then use {TOOL} again with the same words;",
+                "- pending: thank them for holding, say you are still waiting on the account holder and ask them "
+                f"to hold a little longer; when they answer, use {TOOL} again with the reply's ticket, before "
+                "saying anything else;",
                 "- stop: thank them, say the account holder will follow up, and end the call.",
                 f"If {TOOL} fails, times out or returns no decision from this list, you have no answer: agree to "
-                "nothing, share nothing new, and say the account holder will follow up.",
+                "nothing, share nothing new, say the account holder will follow up, and end the call.",
             ]
         else:
             lines += [
@@ -134,18 +146,50 @@ class CallSession:
                 "url": f"{bridge_url.rstrip('/')}/calls/{self.id}/check",
                 "method": "POST",
                 "headers": {"Authorization": f"Bearer {self.token}"},
-                "body": {"they_said": "{{input.they_said}}", "you_would_say": "{{input.you_would_say}}"},
+                "body": {"they_said": "{{input.they_said}}", "you_would_say": "{{input.you_would_say}}",
+                         "ticket": "{{input.ticket}}"},
                 "input_schema": {
                     "example": {"they_said": "I can refund $36 to your card. Would that work?",
                                 "you_would_say": "Yes, the $36 refund works, thank you."},
                     "type": "object",
-                    "properties": {"they_said": {"type": "string"}, "you_would_say": {"type": "string"}},
+                    "properties": {"they_said": {"type": "string"}, "you_would_say": {"type": "string"},
+                                   "ticket": {"type": "string"}},
                     "required": ["they_said", "you_would_say"],
                 },
-                "response": {"decision": "$.decision", "instruction": "$.instruction"},
+                "response": {"decision": "$.decision", "instruction": "$.instruction", "ticket": "$.ticket"},
                 "timeout": int((self._hold + 10) * 1000),
             }]
         return body
+
+    def reaches(self, bridge_url: str) -> Optional[str]:
+        """None when ``bridge_url`` reaches this plugin's bridge for this call, otherwise why not, in a
+        few words without the token: the address bland.ai's tool will call, pinged the way it will."""
+        req = urllib.request.Request(f"{bridge_url.rstrip('/')}/calls/{self.id}/check", data=b'{"ping": true}',
+                                     method="POST", headers={"Authorization": f"Bearer {self.token}",
+                                                             "Content-Type": "application/json"})
+        reason = self._ping(req)
+        if reason is not None:
+            self._sleep(PING_RETRY_S)
+            reason = self._ping(req)
+        return reason
+
+    def _ping(self, req: urllib.request.Request) -> Optional[str]:
+        try:
+            with self._urlopen(req, timeout=PING_TIMEOUT_S) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as exc:
+            return f"HTTP {exc.code}"
+        except urllib.error.URLError as exc:
+            return f"connection failed: {exc.reason}"
+        except TimeoutError:
+            return "no answer in time"
+        except (OSError, http.client.HTTPException) as exc:
+            return f"connection failed: {exc or type(exc).__name__}"
+        try:
+            out = json.loads(raw or b"")
+        except ValueError:
+            return "not JSON"
+        return None if out == {"ready": self.id} else "an answer that is not this bridge's"
 
     def place(self, client: Bland, bridge_url: Optional[str]) -> None:
         self.call_id = client.send_call(self.payload(bridge_url))
@@ -154,44 +198,58 @@ class CallSession:
 
     # --- the bridge side: a request from the call ---------------------------------------
 
-    def check(self, they_said: str, you_would_say: str) -> dict:
+    def check(self, they_said: str, you_would_say: str, ticket: str = "") -> dict:
         """bland.ai's agent asks before it says yes. Holds up to ``hold_s`` for the user's answer.
-        A question is its words: asking again with the same words (after ``pending``) is the same
-        question, different words a new one, so an answer never reaches an offer it was not given to."""
+        A request with the ticket of an undelivered question (from its ``pending`` reply) is that question,
+        whatever its words. Otherwise a question is its words: the same words are the same question,
+        different words a new one, so an answer never reaches an offer it was not given to."""
         key = _same(they_said, you_would_say)
         with self._cv:
-            q = next((q for q in self.questions
-                      if not q.get("delivered") and _same(q["they_said"], q["you_would_say"]) == key), None)
+            open_ = [q for q in self.questions if not q.get("delivered")]
+            q = next((q for q in open_ if ticket and q.get("ticket") == ticket), None)
+            q = q or next((q for q in open_ if _same(q["they_said"], q["you_would_say"]) == key), None)
             if q is None:
                 findings = self.guard.check(you_would_say or "", "agree")
-                q = {"they_said": they_said, "you_would_say": you_would_say,
-                     "shares": [f.as_dict() for f in findings if f.kind == "detail"], "answer": None}
+                q = {"they_said": they_said, "you_would_say": you_would_say, "ticket": secrets.token_hex(3),
+                     "shares": [f.as_dict() for f in findings if f.kind == "detail"], "answer": None,
+                     "at": self._clock()}
                 self.questions.append(q)
                 self.save()
                 self._cv.notify_all()
             deadline = self._clock() + self._hold
-            while q["answer"] is None:
+            while True:
+                self._expire()
                 left = deadline - self._clock()
-                if left <= 0:
+                if q["answer"] is None and not q.get("asking"):
+                    left = min(left, q["at"] + ANSWER_S - self._clock())
+                if q["answer"] is not None or left <= 0:
                     break
                 self._cv.wait(timeout=left)
             if q["answer"] is None:
-                return {"decision": "pending",
-                        "instruction": "The account holder has not answered yet. Ask them to keep holding, then ask again."}
+                return {"decision": "pending", "ticket": q.get("ticket", ""), "instruction": (
+                    "The account holder has not answered yet. Say: \"Thank you for holding. I'm still waiting on the "
+                    "account holder. Could you hold a little longer?\" When they answer, use "
+                    f"{TOOL} again with ticket {q.get('ticket', '')}, before saying anything else.")}
             q["delivered"] = True
             self.save()
-            return _decision(q["answer"])
+            return _decision(q["answer"], q["you_would_say"])
 
     # --- the Hermes side: following the call --------------------------------------------
 
     def follow(self, client: Bland, ask: Optional[Ask], max_wait_s: float = 240.0) -> dict:
-        """Follow the call: new transcript lines, questions for the user, the end of the call."""
+        """Follow the call: new transcript lines, questions for the user, the end of the call. With nobody
+        to ask directly (``ask`` None) a question returns at once as ``needs_answer``, for the model."""
         start = self._clock()
         heard: list[str] = []
+        waiting = None
         while True:
             heard += self._read(client)
             self._answer_questions(ask)
-            if self.ended or self._read_failures >= READ_FAILURES or self._clock() - start >= max_wait_s:
+            with self._cv:
+                self._expire()
+                waiting = self.waiting() if ask is None else None
+            if (waiting is not None or self.ended or self._read_failures >= READ_FAILURES
+                    or self._clock() - start >= max_wait_s):
                 break
             self._sleep(self._poll)
         # bland.ai marks a call completed before it has priced and summarised it
@@ -206,6 +264,18 @@ class CallSession:
             out.update({k: self.details.get(k) for k in ("summary", "call_length", "price", "answered_by",
                                                          "recording_url", "error_message") if self.details.get(k) is not None})
             out["hint"] = "The call is over. Call support_call_end with the outcome."
+        elif waiting is not None:
+            labels = self.labels(waiting)
+            out.update({"status": "needs_answer", "session_id": self.id, "they_said": waiting["they_said"],
+                        "you_would_say": waiting["you_would_say"], "shares": labels,
+                        "question": _question(waiting, labels), "instruction": (
+                            "The call is holding for the account holder's decision. If this meets what the user "
+                            "asked for, call support_call_wait with this session_id and answer 'yes': Hermes will "
+                            "show the user the question before anything is said. To turn it down and keep going, "
+                            "answer 'no'. To hang up, answer 'end'. If support asked for a detail you were not "
+                            "given, ask the user for it, then pass their words as the answer. Never answer yes for "
+                            f"the user in any other way. With no answer within {round(ANSWER_S)} seconds of the "
+                            "question, support is told the account holder will follow up.")})
         else:
             out["hint"] = "Still on the call. Call support_call_wait to keep following it."
         if not self.bridged and self.ended:
@@ -239,6 +309,8 @@ class CallSession:
             text = str(line.get("text") or "").strip()
             if not text:
                 continue
+            if who == "note" and self.turns and (self.turns[-1].who, self.turns[-1].text) == ("note", text):
+                continue  # bland.ai repeats its waiting note for as long as the hold lasts
             self.turns.append(Turn(who, text))
             if who == "support":
                 self.guard.heard.append(text)
@@ -250,22 +322,52 @@ class CallSession:
             self.ended = True
         return heard
 
-    def _answer_questions(self, ask: Optional[Ask]) -> None:
+    def waiting(self) -> Optional[dict]:
+        """The oldest question from the call that nobody is answering yet."""
         with self._cv:
-            q = next((q for q in self.questions if q["answer"] is None and not q.get("asking")), None)
+            return next((q for q in self.questions if q["answer"] is None and not q.get("asking")), None)
+
+    def labels(self, q: dict) -> list[str]:
+        """The labels of the user's shareable details that the answer drafted for ``q`` would say."""
+        said = _norm(q["you_would_say"] or "")
+        return [k for k, v in self.guard.allowed.items()
+                if not k.startswith("told ") and _norm(str(v)) and _norm(str(v)) in said]
+
+    def answer(self, q: dict, answer: str) -> bool:
+        """The user's answer to ``q``, brought back by the model; False when it was answered meanwhile."""
+        with self._cv:
+            if q["answer"] is not None:
+                return False
+            self._record(q, answer)
+            return True
+
+    def _answer_questions(self, ask: Optional[Ask]) -> None:
+        if ask is None:
+            return  # nobody to ask here: follow hands the question to the model
+        with self._cv:
+            q = self.waiting()
             if q is None:
                 return
             q["asking"] = True
-        question = _question(q)
-        answer = None
-        if ask is not None:
-            self.progress("Support made an offer on the call: waiting for your call.")
-            answer = ask(question, [YES, NO, END_CALL])
+        self.progress("Support made an offer on the call: waiting for your call.")
+        answer = ask(_question(q), [YES, NO, END_CALL])
+        with self._cv:
+            self._record(q, answer)
+
+    def _expire(self) -> None:
+        """A question nobody is asking about gets no answer after ``ANSWER_S``: support is not held forever.
+        Called with ``_cv`` held."""
+        for q in self.questions:
+            if q["answer"] is None and not q.get("asking") and self._clock() - q.setdefault("at", self._clock()) >= ANSWER_S:
+                self._record(q, None, f"Asked you: \"{q['they_said']}\". Nobody answered within {round(ANSWER_S)} seconds.")
+                self.progress("Nobody answered support's question in time: they were told you will follow up.")
+
+    def _record(self, q: dict, answer: Optional[str], note: Optional[str] = None) -> None:
         with self._cv:
             q["answer"] = answer or ""
             q.pop("asking", None)
-            self.approvals.append({"asked": question, "answer": answer})
-            self.turns.append(Turn("note", f"Asked you: \"{q['they_said']}\". You answered: {answer or 'no answer'}"))
+            self.approvals.append({"asked": _question(q), "answer": answer})
+            self.turns.append(Turn("note", note or f"Asked you: \"{q['they_said']}\". You answered: {answer or 'no answer'}"))
             if answer not in (None, "", YES, NO, END_CALL):
                 self.guard.allowed[f"told {len(self.guard.allowed) + 1}"] = answer
             self.save()
@@ -349,21 +451,24 @@ class CallSession:
                         out.append(f"said {f.text!r}: {f.why}")
                     elif f.kind == "commitment" and not accepted:
                         out.append(f"said {f.text!r} with no approval from you")
+                if not asks_back(t.text):  # a reply closes the offers heard before it; a question back does not
+                    guard.answered = len(guard.heard)
         return out
 
     def save(self) -> None:
-        self.folder.mkdir(parents=True, exist_ok=True)
-        state = {
-            "id": self.id, "phone_number": self.phone_number, "company": self.company, "task": self.task,
-            "allowed": self.guard.allowed, "private": self.guard.private, "max_minutes": self.max_minutes,
-            "record": self.record, "token": self.token, "call_id": self.call_id, "bridged": self.bridged, "seen": self.seen,
-            "turns": [asdict(t) for t in self.turns], "questions": [{k: v for k, v in q.items() if k != "asking"}
-                                                                    for q in self.questions],
-            "approvals": self.approvals, "details": self.details, "ended": self.ended, "closed": self.closed,
-        }
-        tmp = self.folder / "session.json.tmp"
-        tmp.write_text(json.dumps(state, indent=1, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(self.folder / "session.json")
+        with self._cv:  # the bridge's threads save too, through the same temporary file
+            self.folder.mkdir(parents=True, exist_ok=True)
+            state = {
+                "id": self.id, "phone_number": self.phone_number, "company": self.company, "task": self.task,
+                "allowed": self.guard.allowed, "private": self.guard.private, "max_minutes": self.max_minutes,
+                "record": self.record, "token": self.token, "call_id": self.call_id, "bridged": self.bridged,
+                "seen": self.seen, "turns": [asdict(t) for t in self.turns],
+                "questions": [{k: v for k, v in q.items() if k not in ("asking", "at")} for q in self.questions],
+                "approvals": self.approvals, "details": self.details, "ended": self.ended, "closed": self.closed,
+            }
+            tmp = self.folder / "session.json.tmp"
+            tmp.write_text(json.dumps(state, indent=1, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self.folder / "session.json")
 
     @classmethod
     def restore(cls, folder: Path, **kw) -> "CallSession":
@@ -384,18 +489,30 @@ def _same(they_said: str, you_would_say: str) -> tuple[str, str]:
     return _norm(they_said or ""), _norm(you_would_say or "")
 
 
-def _question(q: dict) -> str:
-    lines = [f"On the call, support said: \"{q['they_said']}\"",
-             f"If you say yes, I'll answer: \"{q['you_would_say']}\""]
+def _filled(value) -> str:
+    """A body value as text; one bland.ai left as its template (``{{input.x}}``, the input never given) is empty."""
+    text = str(value or "")
+    return "" if re.fullmatch(r"\s*\{\{.*\}\}\s*", text, re.S) else text
+
+
+def _question(q: dict, labels: list = ()) -> str:
+    lines = [f"On the call, support said: \"{q['they_said']}\""]
+    if not q["you_would_say"]:
+        lines.append("I have no answer drafted. What should I answer? If you say yes, I'll tell them you agree.")
+        return "\n".join(lines)
+    lines.append(f"If you say yes, I'll answer: \"{q['you_would_say']}\"")
     if q.get("shares"):
         lines.append("That answer shares " + "; ".join(f"{f['why']} ({f['text']})" for f in q["shares"]) + ".")
+    if labels:
+        lines.append("It says your " + ", ".join(labels) + ".")
     lines.append("Go ahead?")
     return "\n".join(lines)
 
 
-def _decision(answer: str) -> dict:
+def _decision(answer: str, proposed: str = "") -> dict:
     if answer == YES:
-        return {"decision": "accepted", "instruction": "The account holder agrees. Say yes as you proposed."}
+        return {"decision": "accepted", "instruction": "The account holder agrees. " + (
+            "Say yes as you proposed." if proposed else "Say yes to what they asked.")}
     if answer == NO:
         return {"decision": "declined",
                 "instruction": "The account holder does not agree. Politely turn it down and keep working toward the goal."}
@@ -428,7 +545,9 @@ class Bridge:
                     return self._send(400, {"error": "body is not JSON"})
                 if not isinstance(data, dict):
                     return self._send(400, {"error": "body is not an object"})
-                self._send(200, call.check(str(data.get("they_said") or ""), str(data.get("you_would_say") or "")))
+                if data == {"ping": True}:
+                    return self._send(200, {"ready": call.id})
+                self._send(200, call.check(*(_filled(data.get(k)) for k in ("they_said", "you_would_say", "ticket"))))
 
             def _send(self, code: int, body: dict) -> None:
                 raw = json.dumps(body).encode()

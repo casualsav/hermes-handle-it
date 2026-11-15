@@ -150,7 +150,7 @@ def test_hermes_approval_gate_path(tmp_path):
     action, question = s.before_approval("Yes, please go ahead.", "agree")
     assert action == "ask" and "Shall I go ahead?" in question
     assert page.sent == [HOLD]
-    assert s.before_approval("Thanks, one more question about shipping.", "ask") == ("", "")
+    assert s.before_approval("Thanks, does that cover shipping too?", "ask") == ("", "")
     s.before_approval("Yes, please go ahead.", "agree")
     out = s.send("Yes, please go ahead.", intent="agree", ask=None)
     assert out["approved_by_user"] is True and page.sent == [HOLD, "Yes, please go ahead."]
@@ -416,3 +416,61 @@ def test_a_reply_that_needed_an_ok_asks_the_agent_to_report_it(tmp_path):
     s.before_approval("Yes, please go ahead.", "agree")
     out = s.send("Yes, please go ahead.", intent="agree", ask=None)
     assert "Yes, please go ahead." in out["tell_user"]
+
+
+def test_a_counter_offer_put_as_a_question_is_still_the_users_call(tmp_path):
+    """Seen on a live run: the model turned the 20% offer down with "…Is that possible?" and the user was never asked."""
+    s, page, clock = session(tmp_path, {"full refund": (5.0, "Let me check with my supervisor.")})
+    s.wait_for_reply()
+    page.lines += ["Dana", "I can offer a 20% partial refund ($36). Would that work for you?"]
+    s.wait_for_reply()
+    asked = []
+    out = s.send("I appreciate that, but I'd rather have a full refund of the $180. Is that possible?", intent="ask",
+                 ask=lambda q, c: asked.append(q) or DECLINE_OFFER)
+    assert len(asked) == 1 and "partial refund" in asked[0] and out["user_declined_offer"] is True
+
+
+# --- a turn-down of an open offer is the user's call on Hermes's card too --------------------------
+
+TURN_DOWN = "No thanks, I'd like a full refund."
+
+
+def _offer_open(tmp_path, replies=None):
+    s, page, clock = session(tmp_path, replies or {})
+    s.wait_for_reply()
+    page.lines += ["Dana", "I can offer a 20% partial refund ($36). Would that work for you?"]
+    s.wait_for_reply()
+    return s, page
+
+
+def test_a_turn_down_with_nobody_to_ask_in_the_tool_goes_to_hermess_card(tmp_path):
+    s, page = _offer_open(tmp_path, {"full refund": (5.0, "Let me check with my supervisor.")})
+    action, question = s.before_approval(TURN_DOWN, "decline")
+    assert action == "turn_down" and "partial refund" in question and TURN_DOWN in question
+    assert page.sent == [HOLD]
+    out = s.send(TURN_DOWN, intent="decline", ask=None)
+    assert page.sent[-1] == TURN_DOWN
+    assert s.decided == {"Dana: I can offer a 20% partial refund ($36). Would that work for you?": "decline"}
+    assert out["user_declined_offer"] is True and "tell_user" not in out
+
+
+def test_a_question_back_to_an_open_offer_is_not_carded(tmp_path):
+    s, page = _offer_open(tmp_path)
+    assert s.before_approval("Does the partial refund include shipping?", "ask") == ("", "")
+    assert page.sent == []
+
+
+def test_after_the_user_denies_accepting_a_turn_down_is_not_carded_again(tmp_path):
+    s, page = _offer_open(tmp_path)
+    assert s.before_approval("Yes, I'll take the $36 partial refund.", "agree")[0] == "ask"
+    s.approval_refused("Yes, I'll take the $36 partial refund.", "BLOCKED: User denied this action.")
+    assert s.before_approval(TURN_DOWN, "decline") == ("", "")
+
+
+def test_a_denied_turn_down_sends_nothing_and_leaves_the_offer_open(tmp_path):
+    s, page = _offer_open(tmp_path)
+    assert s.before_approval(TURN_DOWN, "decline")[0] == "turn_down"
+    assert s.approval_refused(TURN_DOWN, "BLOCKED: User denied this action.") == "declined"
+    assert page.sent == [HOLD] and s.pending is None and s.decided == {}
+    assert "turn-down was not sent" in s.turns[-1].text
+    assert s.before_approval(TURN_DOWN, "decline")[0] == "turn_down"

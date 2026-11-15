@@ -15,6 +15,7 @@ import pytest
 from support_chat_plugin import handlers, phone_tools
 from support_chat_plugin.bland import Bland, BlandError
 from support_chat_plugin.phone import NO, YES, CallSession
+from support_chat_plugin.session import Turn
 
 _spec = importlib.util.spec_from_file_location("bland_standin", Path(__file__).parents[1] / "demo" / "bland_standin.py")
 standin_mod = importlib.util.module_from_spec(_spec)
@@ -149,12 +150,160 @@ def test_the_key_is_read_through_hermess_secret_scope(monkeypatch):
     assert Bland().key == "scoped-key" and asked == ["BLAND_API_KEY"]
 
 
-def test_nobody_to_ask_means_nothing_is_agreed(standin):
-    sid, out = _run(None)
+def _start_unasked(**extra):
+    """A call placed from a gateway: Hermes passes the tool no agent, so nobody can be asked directly."""
+    args = {**ARGS, **extra}
+    assert phone_tools.pre_tool_call(tool_name="support_call_start", args=args)["action"] == "approve"
+    return json.loads(phone_tools.start(args, session_id="hermes-1"))
+
+
+def test_with_nobody_to_ask_the_question_goes_back_to_the_model_and_the_call_holds(standin):
+    """Seen on a live call: with no clarify callback the bridge answered stop within a second and the
+    user was never asked."""
+    out = _start_unasked()
+    assert out["status"] == "needs_answer" and out["session_id"]
+    assert out["they_said"] == standin_mod.PARTIAL and out["you_would_say"] == "Yes, the $36 partial refund works."
+    assert standin_mod.PARTIAL in out["question"]
+    assert "support_call_wait" in out["instruction"] and "'yes'" in out["instruction"]
+    assert "Never answer yes for the user in any other way" in out["instruction"]
+    assert standin_mod.PARTIAL in out["support_said"]
+    time.sleep(0.5)
     call = next(iter(standin.calls.values()))
-    assert [c["got"]["decision"] for c in call.tool_calls] == ["stop"]
-    assert not any(t["text"].startswith("Yes") for t in call.transcripts if t["user"] == "assistant")
-    assert "follow up" in out["summary"]
+    assert call.tool_calls == []  # the request is still held, not answered stop
+    assert phone_tools._calls[out["session_id"]].questions[0]["answer"] is None
+
+
+def test_a_yes_from_the_model_goes_through_hermess_approval_card(standin):
+    sid = _start_unasked()["session_id"]
+    args = {"session_id": sid, "answer": "yes", "max_wait_s": 60}
+    directive = phone_tools.pre_tool_call(tool_name="support_call_wait", args=args)
+    assert directive["action"] == "approve" and directive["rule_key"].startswith(f"support_call:{sid}:")
+    assert standin_mod.PARTIAL in directive["message"] and "Yes, the $36 partial refund works." in directive["message"]
+
+    out = json.loads(phone_tools.wait(args, session_id="hermes-1"))
+    call = next(iter(standin.calls.values()))
+    assert [c["got"]["decision"] for c in call.tool_calls] == ["accepted"]
+    assert out["status"] == "call_ended" and "$36" in out["summary"]
+    assert out["tell_user"] == f"Support was told yes to: \"{standin_mod.PARTIAL}\". Say so in your next message to the user."
+    assert phone_tools._calls[sid].questions[0]["answer"] == YES
+
+
+def test_a_yes_that_skipped_the_card_or_was_refused_there_is_not_recorded(standin):
+    sid = _start_unasked()["session_id"]
+    args = {"session_id": sid, "answer": "yes", "max_wait_s": 5}
+    out = json.loads(phone_tools.wait(args))
+    assert "approval prompt" in out["error"]
+    assert phone_tools._calls[sid].questions[0]["answer"] is None
+
+    assert phone_tools.pre_tool_call(tool_name="support_call_wait", args=args)["action"] == "approve"
+    phone_tools.post_tool_call(tool_name="support_call_wait", args=args, status="blocked", error_message="User denied")
+    assert "approval prompt" in json.loads(phone_tools.wait(args))["error"]
+    assert phone_tools._calls[sid].questions[0]["answer"] is None and phone_tools._approved == {}
+
+
+@pytest.mark.parametrize("answer, decision", [("no", "declined"), ("end", "stop")])
+def test_a_no_or_an_end_from_the_model_needs_no_card(standin, answer, decision):
+    sid = _start_unasked()["session_id"]
+    args = {"session_id": sid, "answer": answer, "max_wait_s": 60}
+    assert phone_tools.pre_tool_call(tool_name="support_call_wait", args=args) is None
+    out = json.loads(phone_tools.wait(args))
+    call = next(iter(standin.calls.values()))
+    assert call.tool_calls[0]["got"]["decision"] == decision
+    assert "tell_user" not in out
+    if answer == "no":  # turned down, the call goes on to the next offer, which comes back to the model again
+        assert out["status"] == "needs_answer" and out["they_said"] == standin_mod.FULL
+
+
+def test_an_answer_with_nothing_waiting_is_an_error(standin):
+    sid = _start_unasked()["session_id"]
+    assert json.loads(phone_tools.wait({"session_id": sid, "answer": "end", "max_wait_s": 60}))["status"] == "call_ended"
+    out = json.loads(phone_tools.wait({"session_id": sid, "answer": "no"}))
+    assert "Nothing" in out["error"] and "waiting" in out["error"]
+
+
+class Done:
+    """A bland.ai whose call has ended and been priced."""
+
+    def call(self, call_id):
+        return {"completed": True, "price": 0.1, "transcripts": []}
+
+
+class OnHold:
+    """A bland.ai whose call goes on, with nothing new said."""
+
+    def call(self, call_id):
+        return {"status": "in-progress", "transcripts": []}
+
+
+def _held_question(call, they_said, you_would_say):
+    """bland.ai's agent asking on the bridge: held in its own thread until the call has an answer."""
+    got = []
+    threading.Thread(target=lambda: got.append(call.check(they_said, you_would_say)), daemon=True).start()
+    for _ in range(500):
+        if call.questions:
+            break
+        time.sleep(0.01)
+    return got
+
+
+def _fake_clock_call(tmp_path, monkeypatch, **kw):
+    now = [0.0]
+    call = CallSession("+18005550142", "L.L.Bean", "Return the boots from order 1234", {"order number": "1234"}, [],
+                       tmp_path, clock=lambda: now[0], sleep=lambda s: now.__setitem__(0, now[0] + s), **kw)
+    call.call_id = "x"
+    monkeypatch.setattr(phone_tools, "_calls", {call.id: call})
+    monkeypatch.setattr(phone_tools, "_approved", {})
+    monkeypatch.setattr(phone_tools, "_client", Done())
+    monkeypatch.setattr(handlers, "_approvals_off", lambda: False)
+    return call, now
+
+
+ZIP = "Can I have the name of the caller and the zip code?"
+
+
+def _bridge_answer(got):
+    for _ in range(500):
+        if got:
+            return got[0]
+        time.sleep(0.01)
+    raise AssertionError("the bridge request was never answered")
+
+
+def test_a_typed_answer_with_an_unlisted_detail_gets_the_card_and_plain_guidance_does_not(tmp_path, monkeypatch):
+    call, _ = _fake_clock_call(tmp_path, monkeypatch)
+    got = _held_question(call, ZIP, "Let me check with the account holder.")
+    detail = {"session_id": call.id, "answer": "The zip code is 04032."}
+    assert "approval prompt" in json.loads(phone_tools.wait(detail))["error"]  # not without the card
+    directive = phone_tools.pre_tool_call(tool_name="support_call_wait", args=detail)
+    assert directive["action"] == "approve" and ZIP in directive["message"] and "04032" in directive["message"]
+    assert "not list as shareable" in directive["message"]
+    phone_tools.post_tool_call(tool_name="support_call_wait", args=detail, status="blocked", error_message="User denied")
+
+    guidance = {"session_id": call.id, "answer": "Ask them to read the web address aloud."}
+    assert phone_tools.pre_tool_call(tool_name="support_call_wait", args=guidance) is None
+    json.loads(phone_tools.wait(guidance))
+    assert _bridge_answer(got) == {"decision": "instruction", "instruction": "Ask them to read the web address aloud."}
+
+
+def test_a_question_nobody_answers_is_answered_stop_after_170_seconds(tmp_path, monkeypatch):
+    call, now = _fake_clock_call(tmp_path, monkeypatch, hold_s=85)
+    got = _held_question(call, ZIP, "Let me check with the account holder.")
+    assert call.follow(OnHold(), None)["status"] == "needs_answer"
+    now[0] = 169.0
+    assert call.follow(OnHold(), None)["status"] == "needs_answer" and got == []
+    now[0] = 170.0
+    call.follow(OnHold(), None)
+    assert _bridge_answer(got)["decision"] == "stop"
+    assert any(t.who == "note" and ZIP in t.text and "Nobody answered" in t.text for t in call.turns)
+
+
+def test_a_call_from_a_gateway_belongs_to_the_hermes_session_that_placed_it(standin):
+    sid = _start_unasked()["session_id"]  # Hermes's session id comes as the session_id keyword, with no agent
+    assert phone_tools._owners[sid] == "hermes-1"
+    phone_tools.on_session_finalize(session_id="hermes-2")
+    assert sid in phone_tools._calls and phone_tools._bridge is not None
+    phone_tools.on_session_finalize(session_id="hermes-1")
+    assert phone_tools._calls == {} and phone_tools._bridge is None
 
 
 def test_bridge_refuses_a_request_without_the_calls_token(standin):
@@ -166,6 +315,68 @@ def test_bridge_refuses_a_request_without_the_calls_token(standin):
     with pytest.raises(urllib.error.HTTPError) as err:
         urllib.request.urlopen(req, timeout=5)
     assert err.value.code == 404
+
+
+def _ping(url, token):
+    req = urllib.request.Request(url, data=b'{"ping": true}', method="POST",
+                                 headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return json.loads(resp.read())
+
+
+def test_the_bridge_answers_a_ping_for_its_call_and_records_nothing(tmp_path):
+    from support_chat_plugin.phone import Bridge
+    bridge = Bridge()
+    try:
+        call = CallSession("+18005550142", "Northwind", "Full refund", {}, [], tmp_path)
+        bridge.calls[call.id] = call
+        url = f"http://127.0.0.1:{bridge.port}/calls/{call.id}/check"
+        assert _ping(url, call.token) == {"ready": call.id}
+        assert call.questions == [] and not list(tmp_path.iterdir())
+        with pytest.raises(urllib.error.HTTPError) as err:
+            _ping(url, "wrong")
+        assert err.value.code == 404
+        assert call.reaches(f"http://127.0.0.1:{bridge.port}") is None
+    finally:
+        bridge.close()
+
+
+def test_a_call_whose_bridge_address_does_not_reach_the_bridge_is_not_placed(standin, monkeypatch, make_ctx):
+    # a tunnel that forwards somewhere else: here the stand-in, which knows no /calls/<id>/check
+    monkeypatch.setattr(handlers, "_ctx", make_ctx({"call_bridge_url": standin.url, "call_bridge_port": _free_port()}))
+    assert phone_tools.pre_tool_call(tool_name="support_call_start", args=dict(ARGS))["action"] == "approve"
+    out = json.loads(phone_tools.start(dict(ARGS), parent_agent=User([YES])))
+    assert out["error"].startswith(f"Not placed: the approval bridge address ({standin.url}) does not reach")
+    assert f"127.0.0.1:{phone_tools._bridge.port}" in out["error"]
+    assert standin.calls == {} and phone_tools._bridge.calls == {}
+
+
+def test_a_bridge_check_that_fails_says_why_without_the_token(tmp_path):
+    slept = []
+    tries = []
+
+    def refused(req, timeout):
+        tries.append(timeout)
+        raise urllib.error.URLError(ConnectionRefusedError("Connection refused"))
+
+    call = CallSession("+18005550142", "Northwind", "Full refund", {}, [], tmp_path, sleep=slept.append, urlopen=refused)
+    reason = call.reaches("https://tunnel.example")
+    assert reason and "refused" in reason and call.token not in reason
+    assert tries == [10, 10] and slept == [2.0]  # one retry, for a tunnel that was just started
+
+    def timed_out(req, timeout):
+        raise TimeoutError("timed out")
+
+    assert CallSession("+1", "N", "t", {}, [], tmp_path, sleep=slept.append, urlopen=timed_out).reaches(
+        "https://tunnel.example") == "no answer in time"
+
+
+def test_a_call_whose_bridge_address_reaches_the_bridge_is_placed(standin):
+    assert phone_tools.pre_tool_call(tool_name="support_call_start", args=dict(ARGS))["action"] == "approve"
+    out = json.loads(phone_tools.start(dict(ARGS), parent_agent=User([NO, YES])))
+    assert "error" not in out and len(standin.calls) == 1
+    assert next(iter(standin.calls.values())).payload["tools"][0]["url"].startswith(
+        f"http://127.0.0.1:{phone_tools._bridge.port}/calls/")
 
 
 def test_without_a_bridge_the_call_can_agree_to_nothing(tmp_path):
@@ -284,6 +495,54 @@ def test_an_answer_goes_only_to_the_question_it_was_given_to(tmp_path):
     assert len(call.questions) == 2
     assert call.check(partial, "Yes, the $36 partial refund works.")["decision"] == "accepted"
     assert call.check(full, "Yes please, the full $180.")["decision"] == "pending"
+    assert call.check("Sure, I'll hold.", "")["decision"] == "pending"  # other words, no ticket: a new question
+    assert len(call.questions) == 3
+
+
+def test_asking_again_with_the_pending_tickets_is_the_same_question_whatever_the_words(tmp_path):
+    """Seen on a live call: after pending, the voice agent passes support's latest words, not the question's."""
+    call = CallSession("+18005550142", "Northwind", "Full refund", {}, [], tmp_path, hold_s=0.05)
+    first = call.check(ZIP, "")
+    assert first["decision"] == "pending" and first["ticket"] == call.questions[0]["ticket"]
+    assert f"ticket {first['ticket']}" in first["instruction"] and "before saying anything else" in first["instruction"]
+    call.answer(call.questions[0], "The zip code is 04032.")
+    restored = CallSession.restore(tmp_path, hold_s=0.05)  # the ticket survives a save
+    assert restored.check("Sure, I'll hold.", "", first["ticket"]) == {
+        "decision": "instruction", "instruction": "The zip code is 04032."}
+    assert len(restored.questions) == 1
+
+
+def test_an_unfilled_template_from_bland_is_an_empty_value(tmp_path):
+    """Seen on a live call: with you_would_say left out, bland.ai sent the template text itself."""
+    from support_chat_plugin.phone import Bridge
+    bridge = Bridge()
+    try:
+        call = CallSession("+18005550142", "Northwind", "Full refund", {}, [], tmp_path, hold_s=0.05)
+        bridge.calls[call.id] = call
+        body = json.dumps({"they_said": ZIP, "you_would_say": "{{input.you_would_say}}", "ticket": "{{ input.ticket }}"})
+        req = urllib.request.Request(f"http://127.0.0.1:{bridge.port}/calls/{call.id}/check", data=body.encode(),
+                                     method="POST", headers={"Authorization": f"Bearer {call.token}",
+                                                             "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert json.loads(resp.read())["decision"] == "pending"
+    finally:
+        bridge.close()
+    q = call.questions[0]
+    assert q["they_said"] == ZIP and q["you_would_say"] == ""
+    question = phone_tools._question(q)
+    assert ZIP in question and "{{" not in question and "I'll answer: \"\"" not in question
+    call.answer(q, YES)
+    assert "Say yes to what they asked." in call.check(ZIP, "")["instruction"]
+
+
+def test_the_tool_declares_the_ticket_and_waits_as_long_as_one_hold(tmp_path):
+    from support_chat_plugin import phone
+    tool = CallSession("+18005550142", "Northwind", "Full refund", {}, [], tmp_path).payload("https://b.example")["tools"][0]
+    assert tool["timeout"] == int((phone.HOLD_S + 10) * 1000)
+    assert tool["input_schema"]["properties"]["ticket"] == {"type": "string"}
+    assert "ticket" not in tool["input_schema"]["required"]
+    assert tool["body"]["ticket"] == "{{input.ticket}}" and tool["response"]["ticket"] == "$.ticket"
+    assert phone.ANSWER_S > phone.HOLD_S
 
 
 class DeadLine:
@@ -309,6 +568,68 @@ def test_a_failed_hang_up_is_loud(tmp_path):
     assert client.stops == 2 and out["hangup"] == "failed"
     assert "may still be running" in out["detail"] and "dashboard" in out["detail"]
     assert "may still be running" in Path(out["transcript_file"]).read_text()
+
+
+ZAPPOS = [  # a real call to a human agent, in order
+    ("support", "Hello. Thank you for contacting Zappos. This is Luna Speak in my happy name."),
+    ("support", "speaking. May I have your name, please?"),
+    ("you", "Hi Luna. I am an AI assistant calling on behalf of a customer with a general question about your return policy."),
+    ("support", "Okay, understand. And could you let me know that general question?"),
+    ("you", "Yes, I have three questions. First, how long does a customer have to return shoes bought on zappos.com? "
+            "Second, is return shipping free? And third, where can I find the full return policy online?"),
+    ("support", "The first one, the return time frame is up to sixty days The return is free, and as to the return policy, "
+                "where it could be located I'd have to go ahead and check into that for you."),
+    ("you", "Got it, sixty days and free returns. Please go ahead and check where I can find the full return policy."),
+    ("support", "Okay, one moment, please."),
+    ("you", "Okay, thank you."),
+    ("support", "I'm seen here from the Zappos.com app. All you need to do is scroll all the way down to the bottom of the "
+                "screen, and from there, you should see the options listed in. contact service as FAQ or."),
+    ("support", "Shipping and return policy."),
+    ("you", "Understood. So to summarize: customers have sixty days to return items, return shipping is free, and the "
+            "policy can be found at the bottom of the app under Shipping and Return Policy. Thank you so much for your "
+            "help, Luna."),
+    ("support", "Not a problem. I'm happy I was able to assist. And apart from that, do you have any other questions or concerns?"),
+    ("you", "No, that answers all my questions. Thank you for your time."),
+]
+
+
+def test_an_answered_offer_does_not_flag_every_later_line(tmp_path):
+    call = CallSession("+18009274466", "Zappos", "Ask about the return policy", {}, [], tmp_path)
+    call.turns = [Turn(who, text) for who, text in ZAPPOS]
+    check = " ".join(call.audit())
+    assert "'Okay, thank you.'" not in check
+    assert "So to summarize" not in check and "that answers all my questions" not in check
+
+
+def test_a_yes_to_a_later_offer_is_still_flagged(tmp_path):
+    call = CallSession("+18005550142", "Northwind", "Full refund for order 1234", {}, [], tmp_path)
+    call.turns = [Turn("support", "I can offer a $36 partial refund. Would that work?"),
+                  Turn("you", "No thanks, the account holder would like the full refund."),
+                  Turn("support", "I can offer a $50 store credit. Would you like that?"),
+                  Turn("you", "Yes, the store credit works.")]
+    assert call.audit() == ["said 'Yes, the store credit works.' with no approval from you"]
+
+
+class Waiting:
+    """A bland.ai on hold: the same waiting note, again and again, between two support lines said twice."""
+
+    def call(self, call_id):
+        note = "[Waiting] Auto response disabled by IVR mode (amd: true)"
+        lines = [("user", "Please hold."), *[("agent-action", note)] * 26, ("user", "Please hold."),
+                 ("assistant", "Thank you."), ("assistant", "Thank you."), ("agent-action", note)]
+        return {"transcripts": [{"id": i, "user": who, "text": text} for i, (who, text) in enumerate(lines)]}
+
+
+def test_a_waiting_note_said_again_is_written_once(tmp_path):
+    call = CallSession("+18005550142", "Northwind", "Full refund", {}, [], tmp_path)
+    call.call_id = "x"
+    call._read(Waiting())
+    note = "[Waiting] Auto response disabled by IVR mode (amd: true)"
+    assert [(t.who, t.text) for t in call.turns] == [
+        ("support", "Please hold."), ("note", note), ("support", "Please hold."),
+        ("you", "Thank you."), ("you", "Thank you."), ("note", note)]
+    assert call.seen == list(range(31))
+    assert call._read(Waiting()) == [] and len(call.turns) == 6
 
 
 def test_following_stops_when_bland_cannot_be_read(tmp_path):
