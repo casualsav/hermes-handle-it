@@ -173,6 +173,49 @@ SHADOW = """<!doctype html><title>Chat</title><p>Light text</p><div id="host"></
   document.body.appendChild(document.createElement("div")).attachShadow({mode: "closed"}).innerHTML = "<p>Closed text</p>";
 </script>"""
 
+# An analytics or service-worker frame: in a frame that is not rendered, innerText is the raw textContent.
+HIDDEN_FRAME = """<!doctype html><title>Chat</title><p>Visible hello</p>
+<iframe style="display:none" srcdoc="<script>window.trackPageview = 'tracker-code';</script>
+<noscript>You need to enable JavaScript to run this app.</noscript><p>Hidden frame text</p>"></iframe>"""
+
+# A contact form (Gorgias's, on a real store) that e-mails support: no chat, and no <form> around the fields.
+CONTACT_FORM = """<!doctype html><title>Contact us</title><h1>Contact us</h1>
+<div class="form"><div><label for="name">Name</label><input id="name" type="text"></div>
+<div><label for="email">Email</label><input id="email" type="email"></div>
+<div><label for="subject">Subject</label><select id="subject"><option value="">Select a subject</option><option>Order Status</option></select></div>
+<div><label for="message">Message</label><textarea id="message"></textarea></div>
+<div><button type="button">Send</button></div></div>"""
+
+# Each click lands in window.clicked, so a test can say what the plugin pressed.
+_RECORD = """<script>window.clicked = [];
+document.addEventListener("click", (e) => { const c = e.target.closest("[data-k]"); if (c) window.clicked.push(c.dataset.k); }, true);
+</script>"""
+_PANEL = """<div id="panel" hidden><textarea placeholder="Type a message here..."></textarea><button>Send</button></div>
+<script>window.openChat = () => { document.getElementById("panel").hidden = false; };</script>"""
+
+# Chaport's and Provide Support's shape: a nameless bubble, absolute inside a fixed container, marked as chat only
+# by its class, and an FAQ button elsewhere on the page whose name speaks of a chat.
+ICON_LAUNCHER = f"""<!doctype html><title>Shop</title>{_RECORD}
+<button data-k="faq" aria-expanded="false">How can I add your chat to my website?</button>{_PANEL}
+<div class="widget-container" style="position:fixed;right:0;bottom:0;width:0;height:0">
+  <div class="chat-launcher-button" data-k="bubble" onclick="openChat()"
+       style="position:absolute;right:20px;bottom:20px;width:60px;height:60px;border-radius:50%;background:#f60;cursor:pointer">
+    <svg width="60" height="60"><circle cx="30" cy="30" r="12" fill="#fff"/></svg></div></div>"""
+
+# Zendesk's and Intercom's shape: the bubble is a small fixed frame of its own.
+FRAME_LAUNCHER = f"""<!doctype html><title>Shop</title>{_RECORD}{_PANEL}
+<iframe name="chat-launcher" src="launcher-frame.html"
+        style="position:fixed;right:20px;bottom:20px;width:64px;height:64px;border:0"></iframe>"""
+LAUNCHER_FRAME = """<!doctype html><body style="margin:0"><button onclick="parent.openChat()"
+  style="width:64px;height:64px;border-radius:50%;border:0;background:#06f"><svg width="24" height="24"></svg></button>"""
+
+# Corner fixtures that are not a chat, though a theme's class or a banner's title mentions one; and Jivo's refusal.
+NO_CHAT = f"""<!doctype html><title>Shop</title>{_RECORD}<div style="height:3000px">Products</div>
+<a href="#top" class="scroll-top chat-offset" data-k="top" title="Back to top"
+   style="position:fixed;right:20px;bottom:20px;width:48px;height:48px;background:#333"></a>
+<div class="cookie-consent" title="Cookies for analytics and our chat" style="position:fixed;right:0;bottom:80px;width:300px">
+  <button data-k="accept">I accept cookies</button> <button data-k="refuse" onclick="this.parentElement.remove()">I refuse cookies</button></div>"""
+
 
 @pytest.fixture()
 def chat_browser(tmp_path, monkeypatch):
@@ -190,6 +233,12 @@ def pages(tmp_path):
     root.mkdir()
     (root / "enter-does-not-send.html").write_text(ENTER_DOES_NOT_SEND, encoding="utf-8")
     (root / "shadow.html").write_text(SHADOW, encoding="utf-8")
+    (root / "hidden-frame.html").write_text(HIDDEN_FRAME, encoding="utf-8")
+    (root / "contact-form.html").write_text(CONTACT_FORM, encoding="utf-8")
+    (root / "icon-launcher.html").write_text(ICON_LAUNCHER, encoding="utf-8")
+    (root / "frame-launcher.html").write_text(FRAME_LAUNCHER, encoding="utf-8")
+    (root / "launcher-frame.html").write_text(LAUNCHER_FRAME, encoding="utf-8")
+    (root / "no-chat.html").write_text(NO_CHAT, encoding="utf-8")
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(root))
     handler.log_message = lambda *a: None
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -238,3 +287,33 @@ def test_text_in_open_shadow_roots_is_read(pages, chat_browser):
     text = _open(chat_browser, pages + "shadow.html").text()
     assert text.index("Light text") < text.index("Shadow hello") < text.index("Nested hello")
     assert text.count("Shadow hello") == 1 and "Closed text" not in text and "teal" not in text
+
+
+def test_a_frame_that_is_not_rendered_is_not_read(pages, chat_browser):
+    text = _open(chat_browser, pages + "hidden-frame.html").text()
+    assert "Visible hello" in text
+    assert "tracker-code" not in text and "enable JavaScript" not in text and "Hidden frame text" not in text
+
+
+def test_an_email_contact_forms_message_box_is_not_a_chat_box(pages, chat_browser):
+    assert _open(chat_browser, pages + "contact-form.html").find_composer(open_chat=False, wait_s=2) is False
+
+
+def _clicked(b, chat):
+    return b.run(lambda: chat._page.evaluate("window.clicked"))
+
+
+def test_a_nameless_corner_bubble_opens_the_chat(pages, chat_browser):
+    chat = _open(chat_browser, pages + "icon-launcher.html")
+    assert chat.find_composer(open_chat=True, wait_s=8) is True
+    assert _clicked(chat_browser, chat) == ["bubble"]
+
+
+def test_a_corner_bubble_in_its_own_frame_is_clicked_inside_it(pages, chat_browser):
+    assert _open(chat_browser, pages + "frame-launcher.html").find_composer(open_chat=True, wait_s=8) is True
+
+
+def test_back_to_top_and_a_cookie_banner_are_not_a_chat(pages, chat_browser):
+    chat = _open(chat_browser, pages + "no-chat.html")
+    assert chat.find_composer(open_chat=True, wait_s=3) is False
+    assert _clicked(chat_browser, chat) == ["refuse"]

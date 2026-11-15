@@ -33,4 +33,4 @@ jobs:
           python-version: "3.11"
       - run: pip install pytest "playwright>=1.40,<2"
       - run: python -m playwright install chromium
-      - run: python -m pytest -q tests
+      - run: python -m pytest -q -rs tests

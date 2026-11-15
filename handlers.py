@@ -121,10 +121,18 @@ def _asker(parent_agent):
     return ask
 
 
-def _progress(parent_agent):
+def _hermes_session(parent_agent, hermes: dict) -> Optional[str]:
+    """The Hermes session a tool call runs in: its agent's, or, where Hermes passes no agent (a gateway),
+    the ``session_id`` keyword it gives every tool handler. Not ``args["session_id"]``, the chat's or call's own id."""
+    if parent_agent is not None:
+        return getattr(parent_agent, "session_id", None)
+    value = hermes.get("session_id")
+    return value if isinstance(value, str) and value else None
+
+
+def _progress(hermes_session: Optional[str]):
     """A short status line while the chat runs, published as the plugin event ``progress`` through
-    Hermes (``ctx.emit``) for any surface that subscribes, with the session it belongs to."""
-    session_id = getattr(parent_agent, "session_id", None) if parent_agent is not None else None
+    Hermes (``ctx.emit``) for any surface that subscribes, with the Hermes session it belongs to."""
 
     def say(message: str) -> None:
         line = f"💬 support chat · {message}"
@@ -133,7 +141,7 @@ def _progress(parent_agent):
         logger.info(line)
         if _ctx is not None:
             try:
-                _ctx.emit("progress", {"text": message, "line": line, "session_id": session_id})
+                _ctx.emit("progress", {"text": message, "line": line, "session_id": hermes_session})
             except Exception:
                 pass
 
@@ -157,7 +165,7 @@ def _sid(session_id) -> str:
     return re.sub(r"[^a-f0-9]", "", str(session_id or ""))
 
 
-def _session(session_id: str, parent_agent) -> ChatSession:
+def _session(session_id: str, hermes_session: Optional[str]) -> ChatSession:
     """The live session, or the saved one reopened after a restart."""
     sid = _sid(session_id)
     with _lock:
@@ -175,10 +183,10 @@ def _session(session_id: str, parent_agent) -> ChatSession:
         live.turns.append(Turn("note", "Reopened the chat after a restart."))
         with _lock:
             _sessions[sid] = live
-    if parent_agent is not None:
+    if hermes_session is not None:
         with _lock:
-            _owners[sid] = getattr(parent_agent, "session_id", None)
-    live.progress = _progress(parent_agent)
+            _owners[sid] = hermes_session
+    live.progress = _progress(hermes_session)
     return live
 
 
@@ -201,7 +209,7 @@ def _wait_s(args: dict, default: float = 240.0) -> float:
 # --- tools ------------------------------------------------------------------------------------
 
 
-def start(args: dict, parent_agent=None, **_kw) -> str:
+def start(args: dict, parent_agent=None, **hermes) -> str:
     url = str(args.get("url") or "").strip()
     task = str(args.get("task") or "").strip()
     if not re.match(r"^https?://", url):
@@ -214,7 +222,8 @@ def start(args: dict, parent_agent=None, **_kw) -> str:
     never = args.get("never_share") or []
     if not isinstance(never, list):
         return _err("never_share must be a list of strings.")
-    progress = _progress(parent_agent)
+    holder = _hermes_session(parent_agent, hermes)
+    progress = _progress(holder)
     try:
         page = _get_browser().open(url)
     except Refused as exc:
@@ -257,7 +266,7 @@ def start(args: dict, parent_agent=None, **_kw) -> str:
     session.progress = progress
     with _lock:
         _sessions[session.id] = session
-        _owners[session.id] = getattr(parent_agent, "session_id", None)
+        _owners[session.id] = holder
     if filled is not None:
         line = ("Filled the chat's pre-chat form: " + ", ".join(filled) if filled
                 else "Sent the chat's pre-chat form with nothing filled in.")
@@ -285,12 +294,12 @@ def _needs_details(labels: list, typed: bool) -> str:
           "these labels and call support_chat_start again.")})
 
 
-def send(args: dict, parent_agent=None, **_kw) -> str:
+def send(args: dict, parent_agent=None, **hermes) -> str:
     message = str(args.get("message") or "").strip()
     if not message:
         return _err("message is empty.")
     try:
-        session = _session(args.get("session_id"), parent_agent)
+        session = _session(args.get("session_id"), _hermes_session(parent_agent, hermes))
     except Exception as exc:
         return _err(str(exc))
     intent = str(args.get("intent") or "inform")
@@ -301,17 +310,17 @@ def send(args: dict, parent_agent=None, **_kw) -> str:
         return _err(f"Sending failed: {exc}", session_id=session.id)
 
 
-def wait(args: dict, parent_agent=None, **_kw) -> str:
+def wait(args: dict, parent_agent=None, **hermes) -> str:
     try:
-        session = _session(args.get("session_id"), parent_agent)
+        session = _session(args.get("session_id"), _hermes_session(parent_agent, hermes))
         return _ok(session.wait_for_reply(max_wait_s=_wait_s(args)))
     except Exception as exc:
         return _err(str(exc))
 
 
-def end(args: dict, parent_agent=None, **_kw) -> str:
+def end(args: dict, parent_agent=None, **hermes) -> str:
     try:
-        session = _session(args.get("session_id"), parent_agent)
+        session = _session(args.get("session_id"), _hermes_session(parent_agent, hermes))
     except Exception as exc:
         return _err(str(exc))
     outcome = str(args.get("outcome") or "").strip() or "No outcome given."
@@ -341,8 +350,13 @@ def pre_tool_call(tool_name: str = "", args: Optional[dict] = None, **_kw):
     action, text = session.before_approval(message, str(args.get("intent") or "inform"))
     if action == "block":
         return {"action": "block", "message": json.dumps({"status": "refused", "detail": text})}
-    if action == "ask":
+    if action in ("ask", "turn_down"):
         if _approvals_off():
+            if action == "turn_down":
+                # Turning an offer down never needed anyone's OK; with nobody to ask it goes through.
+                session.pending = None
+                session.save()
+                return None
             # The gate would wave it through with nobody asked; agreeing for the user is not ours to do.
             session.pending = None
             session.save()
@@ -388,16 +402,34 @@ def post_tool_call(tool_name: str = "", args: Optional[dict] = None, status: str
         session.progress("You declined; nothing was sent.")
 
 
+SUPPORT_ASK = re.compile(
+    r"\b(support|customer (?:service|care)|help ?desk|help cent(?:er|re)|live chat|their chat|chat with (?:them|us|an agent))\b",
+    re.I)
+STEER = (
+    "[Handle It] For a company's support chat use support_chat_start, support_chat_send, support_chat_wait and "
+    "support_chat_end, not the browser tools: only they wait on the agent and ask the user before anything is "
+    "agreed, paid, cancelled or shared. If the chat needs the user signed in, sign in first with the browser tools "
+    "and browser_vault, then call support_chat_start; never type into the chat itself with the browser tools. "
+    "For a support phone line use support_call_start."
+)
+
+
+def pre_llm_call(user_message=None, **_kw):
+    """A turn that asks for a company's support is pointed at this plugin's tools. Without it a model may hold
+    the chat itself with the browser tools, where nothing stands between it and a yes."""
+    if isinstance(user_message, list):
+        user_message = " ".join(str(part.get("text") or "") for part in user_message if isinstance(part, dict))
+    if not isinstance(user_message, str) or not SUPPORT_ASK.search(user_message):
+        return None
+    return {"context": STEER}
+
+
 def on_session_finalize(session_id: Optional[str] = None, **_kw) -> None:
     """Save and close the chats of the Hermes session that is closing (they resume on the next call), and the
     browser once no chat is left: on a gateway, other sessions' chats keep running."""
     global _browser
     with _lock:
-        mine = [cid for cid in _sessions if session_id is None or _owners.get(cid) in (None, session_id)]
-        closing = [_sessions.pop(cid) for cid in mine]
-        for cid in mine:
-            _owners.pop(cid, None)
-        last = not _sessions
+        closing, last = _closing(_sessions, _owners, session_id)
     for s in closing:
         try:
             s.save()
@@ -410,6 +442,15 @@ def on_session_finalize(session_id: Optional[str] = None, **_kw) -> None:
             if not _sessions and _browser is not None:
                 _browser.shutdown()
                 _browser = None
+
+
+def _closing(live: dict, owners: dict, hermes_session: Optional[str]) -> tuple[list, bool]:
+    """Take out of ``live`` what the closing Hermes session holds (everything when it is unknown), with
+    whatever no known session holds; and whether nothing is left. Called with ``_lock`` held."""
+    mine = [k for k in live if hermes_session is None or owners.get(k) in (None, hermes_session)]
+    for k in mine:
+        owners.pop(k, None)
+    return [live.pop(k) for k in mine], not live
 
 
 # --- schemas ----------------------------------------------------------------------------------
@@ -426,7 +467,9 @@ START = {
     "name": "support_chat_start",
     "description": (
         "Hold a company's live customer-support chat for the user, in a browser of your own. Use when the user "
-        "asks you to deal with customer service (a refund, a cancellation, a billing error, a missing parcel). "
+        "asks you to deal with customer service (a refund, a cancellation, a billing error, a missing parcel, a "
+        "question for support). Use this and not the browser tools for a support chat: only this waits on the "
+        "agent for as long as it takes and asks the user before anything is agreed. "
         "Opens the page, finds the chat (clicking a chat button if needed) and waits for the first greeting. "
         "Then loop: read what support said, reply with support_chat_send, or keep holding with support_chat_wait "
         "when they ask you to wait; there is no time limit. Every offer support makes is the user's call, even one that falls short of the goal: do not accept or turn it down yourself and never ask with clarify; reply with the acceptance you would send (e.g. 'Yes, I'll take the $36 partial refund', intent 'agree') and the plugin shows it to the user, who approves or declines it. If they decline, nothing is sent: keep working toward the goal. If nobody answers, nothing is sent either: the plugin tells support the user will follow up and closes the chat, so tell the user that. The same check runs on anything that pays, cancels, changes the account, or shares a detail not in `shareable`. End with support_chat_end and tell the user the outcome. "
@@ -440,7 +483,7 @@ START = {
             "shareable": {
                 "type": "object",
                 "additionalProperties": {"type": "string"},
-                "description": "Details the user allows you to share, label -> value, e.g. {\"order number\": \"1234\", \"name\": \"Sam Rivera\", \"email\": \"sam@example.com\"}. Anything else support asks for goes to the user first.",
+                "description": "Details the user allows you to share, label -> value, e.g. {\"order number\": \"1234\", \"name\": \"Sam Rivera\", \"email\": \"sam@example.com\"}. Anything else support asks for goes to the user first. A chat that starts with a form is filled from these; status needs_details lists what the form asks for that is not here.",
             },
             "never_share": {"type": "array", "items": {"type": "string"}, "description": "Values that must never go into the chat (phone number, address...)."},
             "max_wait_s": {"type": "number", "description": "How long to wait for the greeting, default 90."},

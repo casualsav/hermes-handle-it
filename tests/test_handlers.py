@@ -160,6 +160,25 @@ def test_with_approvals_off_a_risky_reply_is_blocked_as_needs_user(browser, monk
     assert handlers._sessions[sid].pending is None
 
 
+def _offer(sid):
+    handlers._sessions[sid].turns.append(
+        handlers.Turn("support", "Dana: I can offer a 20% partial refund ($36). Would that work for you?"))
+
+
+TURN_DOWN = {"message": "No thanks, I'd like a full refund.", "intent": "decline"}
+
+
+def test_a_turn_down_of_an_open_offer_goes_to_hermess_card_unless_approvals_are_off(browser, monkeypatch):
+    sid = _start()["session_id"]
+    _offer(sid)
+    assert handlers.pre_tool_call("support_chat_send", {"session_id": sid, **TURN_DOWN})["action"] == "approve"
+
+    monkeypatch.setattr(handlers, "_approvals_off", lambda: True)
+    assert handlers.pre_tool_call("support_chat_send", {"session_id": sid, **TURN_DOWN}) is None
+    assert handlers._sessions[sid].pending is None
+    assert handlers.pre_tool_call("support_chat_send", {"session_id": sid, **ACCEPT})["action"] == "block"
+
+
 def test_the_hook_never_reopens_a_chat_that_is_not_live(browser, monkeypatch):
     sid = _start()["session_id"]
     handlers._sessions.pop(sid).save()  # saved on disk, as after a restart
@@ -204,6 +223,23 @@ def test_finalizing_one_hermes_session_leaves_the_others_chats_running(browser):
 
     assert handlers._sessions == {}
     assert browser.down
+
+
+def test_on_a_gateway_the_hermes_session_id_keyword_is_who_holds_the_chat(browser, make_ctx, monkeypatch):
+    """Hermes passes a gateway tool no agent, only its session id as the keyword session_id."""
+    ctx = make_ctx()
+    monkeypatch.setattr(handlers, "_ctx", ctx)
+    sid = json.loads(handlers.start({"url": "https://shop.test/help", "task": "Full refund for order 1234"},
+                                    session_id="hermes-A"))["session_id"]
+    assert handlers._owners[sid] == "hermes-A"
+    assert {p["session_id"] for e, p in ctx.events if e == "progress"} == {"hermes-A"}
+
+    handlers.wait({"session_id": sid}, session_id="hermes-B")  # picked up by another Hermes session
+    assert handlers._owners[sid] == "hermes-B"
+    handlers.on_session_finalize(session_id="hermes-A", platform="telegram")
+    assert sid in handlers._sessions
+    handlers.on_session_finalize(session_id="hermes-B", platform="telegram")
+    assert handlers._sessions == {}
 
 
 def test_a_prechat_form_asking_for_an_unlisted_detail_types_nothing(browser):
@@ -270,3 +306,15 @@ def test_register_provides_exactly_what_plugin_yaml_declares(make_ctx, monkeypat
     assert ("pre_tool_call", handlers.pre_tool_call) in ctx.hooks
     assert ("post_tool_call", handlers.post_tool_call) in ctx.hooks
     assert ("on_session_finalize", handlers.on_session_finalize) in ctx.hooks
+
+
+def test_a_support_request_is_pointed_at_the_plugins_tools():
+    """Seen on a live run: asked for a chat behind a sign-in, the model signed in and then held the whole chat
+    with the browser tools, accepting an offer with nobody asked."""
+    steer = handlers.pre_llm_call(user_message="Northwind's support chat is at northwind.example/help and needs me "
+                                               "signed in. Get me a refund for order 1234.")
+    assert "support_chat_start" in steer["context"] and "browser_vault" in steer["context"]
+    assert "support_call_start" in handlers.pre_llm_call(
+        user_message=[{"type": "text", "text": "Call their customer service line and ask about returns"}])["context"]
+    assert handlers.pre_llm_call(user_message="What's the weather in Lisbon tomorrow?") is None
+    assert handlers.pre_llm_call(user_message=None) is None

@@ -22,7 +22,7 @@ category: automation
 title: Handle It
 requires_hermes: ">=0.21.5"
 docs_url: https://github.com/casualsav/hermes-handle-it
-version: "0.2.0"
+version: "0.3.0"
 platforms: [linux, macos]
 capabilities:
   provides_tools:
@@ -34,6 +34,7 @@ capabilities:
     - support_call_wait
     - support_call_end
   provides_hooks:
+    - pre_llm_call
     - pre_tool_call
     - post_tool_call
     - on_session_finalize

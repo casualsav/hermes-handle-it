@@ -180,6 +180,14 @@ def test_cancelling_and_closing_need_the_user():
         assert kinds(make().check(text)) == ["commitment"], text
 
 
+def test_a_purchase_spoken_of_is_not_a_purchase_made():
+    for text in ("Do I need the receipt or proof of purchase to return them?", "The date of purchase was 3 March.",
+                 "My purchase arrived with a broken zipper."):
+        assert make().check(text) == [], text
+    for text in ("I'd like to purchase the extended warranty.", "Purchase it for me, please."):
+        assert kinds(make().check(text)) == ["commitment"], text
+
+
 def test_a_refusal_in_the_same_clause_is_clean():
     for text in ("I don't want to upgrade", "No, I won't pay for that", "Please don't cancel my plan.",
                  "I can confirm the order number is 1234."):

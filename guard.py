@@ -37,7 +37,7 @@ AFFIRM = re.compile(
     re.I,
 )
 PAYMENT = re.compile(
-    r"\b(pay|paying|charge|purchase|buy|order (?:it|one|the)|upgrade|downgrade|subscribe|unsubscribe|sign (?:me )?up|"
+    r"\b(pay|paying|charge|purchase (?:it|one|the|this|that|an?|another)|buy|order (?:it|one|the)|upgrade|downgrade|subscribe|unsubscribe|sign (?:me )?up|"
     r"authori[sz]e|renew|cancel(?:l?ing)?|terminate|close (?:my |the |this )?(?:account|subscription|plan|membership)|"
     r"confirm (?:the |my |this )?(?:order|purchase|payment|booking|cancell?ation|subscription|upgrade|downgrade)"
     r"(?! ?(?:number|no\b|#|id\b)))\b",
@@ -86,9 +86,9 @@ def is_offer(text: str) -> bool:
 
 
 def asks_back(message: str) -> bool:
-    """A question back to support (no yes, no no) does not answer an offer yet."""
+    """A question back to support (no yes, no no, no counter-offer) does not answer an offer yet."""
     text = _fold(message)
-    return (text.rstrip().endswith("?") and not AFFIRM.search(text)
+    return (text.rstrip().endswith("?") and not AFFIRM.search(text) and not COUNTER.search(text)
             and not NEGATION.search(BENIGN.sub(lambda m: " " * len(m.group()), text)))
 
 
@@ -105,9 +105,11 @@ NEGATION = re.compile(r"\b(no|not|don'?t|do not|won'?t|can'?t|cannot|never|decli
 BENIGN = re.compile(r"\b(no problem|no worries|not a problem|no rush|don'?t worry|why not|can'?t wait|can'?t complain)\b", re.I)
 # Words that take what was offered without a yes in them.
 ACCEPTISH = re.compile(r"\b(fine|great|perfect|good|alright|happy|glad|lovely|excellent|take it|works?)\b", re.I)
+# A reply that bargains: it turns the offer down for something else, even when it ends in a question.
+COUNTER = re.compile(r"\b(prefer|rather|instead|hold off|full refund)\b", re.I)
 # A reply that holds back or bargains rather than accepting.
 HOLDING = re.compile(
-    r"\b(prefer|rather|instead|hold off|think about|let me (?:check|think)|not sure|full refund|"
+    COUNTER.pattern + r"|\b(think about|let me (?:check|think)|not sure|"
     r"(?:one more|another|a quick|quick) question|before i decide)\b",
     re.I,
 )

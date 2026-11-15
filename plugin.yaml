@@ -1,6 +1,6 @@
 name: hermes-handle-it
 label: Handle It
-version: "0.2.0"
+version: "0.3.0"
 author: casualsav
 license: MIT
 description: >
@@ -17,6 +17,7 @@ provides_tools:
   - support_call_wait
   - support_call_end
 provides_hooks:
+  - pre_llm_call
   - pre_tool_call
   - post_tool_call
   - on_session_finalize

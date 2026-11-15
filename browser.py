@@ -13,6 +13,7 @@ import os
 import queue
 import re
 import shutil
+import sys
 import threading
 from concurrent.futures import Future
 from pathlib import Path
@@ -25,20 +26,31 @@ COMPOSERS = ("textarea", '[contenteditable="true"]', '[contenteditable=""]', '[c
 COMPOSER_HINT = re.compile(r"message|type|chat|reply|write|ask|question", re.I)
 # A short button or link name that speaks of a chat and is not a close, minimise, end or transcript control.
 # Playwright hands the pattern to the page's JavaScript, so it uses only syntax both languages read alike.
+_NOT_LAUNCHER = r"close|minimi[sz]e|\bend\b|hide|leave|history|download|transcript|e-?mail"
 LAUNCHER = re.compile(
-    r"^(?!.*(close|minimi[sz]e|\bend\b|hide|leave|history|download|transcript|e-?mail))(?=.{1,60}$)"
+    rf"^(?!.*({_NOT_LAUNCHER}))(?=.{{1,60}}$)"
     r".*(\b(live)?chat|messenger|messaging|message us|contact support|talk to|get help)", re.I)
 # Consent banners are only ever refused: agreeing to tracking is not the plugin's to give.
 REFUSE_CONSENT = re.compile(
-    r"^\s*((reject|decline|deny|refuse)( all)?( cookies)?|(necessary|essential)( cookies)? only|only necessary( cookies)?"
-    r"|use necessary cookies only)\s*$", re.I)
+    r"^\s*((i )?(reject|decline|deny|refuse)( all)?( cookies)?|(necessary|essential)( cookies)? only"
+    r"|only necessary( cookies)?|use necessary cookies only)\s*$", re.I)
 CONSENT_TRIES = 3
+# Chat bubbles load seconds after the page does; until then a launcher found by its name alone is more often the
+# page's own text about chats (a product link that leaves the page) than the chat, so it waits this long.
+NAMED_LAUNCHER_AFTER_S = 8.0
 # A frame that is a chat widget by its address or name; a form in any other place must speak of a chat itself.
 WIDGET_FRAME = re.compile(r"chat|messag|messenger|conversation", re.I)
+# What else sits in a page's bottom corner and may mention a chat in passing; a corner bubble near any of these
+# words is not clicked. JavaScript reads it too.
+CORNER_SKIP = (_NOT_LAUNCHER + r"|cookie|consent|gdpr|privacy|to.?top\b|scroll|newsletter|subscri|promo|coupon"
+               r"|discount|video|player|accessib|a11y|feedback|survey|whatsapp|wechat|snapchat|telegram")
+# A corner bubble is a chat's when something on it says so: WIDGET_FRAME's words, a launcher, or Chaport's
+# own class prefix (its bubble says nothing else).
+CORNER_CHAT = WIDGET_FRAME.pattern + r"|launcher|chaport"
 SEND = re.compile(r"^\s*send\b|^submit$", re.I)
 
-# Per element: the words that name it (attributes and label text), its tag, and how many other visible
-# fields share its <form>; a field among others is a form's field, not a chat's message box.
+# Per element: the words that name it (attributes and label text), its tag, how many other visible fields
+# share its <form>, and its _PRECHAT mark; a field among others is a form's field, not a chat's message box.
 _COMPOSER_INFO = r"""e => {
   const words = [e.getAttribute('aria-label'), e.getAttribute('placeholder'), e.getAttribute('name'), e.id];
   for (const label of e.labels || []) words.push(label.innerText);
@@ -49,11 +61,14 @@ _COMPOSER_INFO = r"""e => {
   const form = e.closest('form');
   const others = form ? Array.from(form.querySelectorAll('input, select, textarea')).filter((x) => x !== e &&
     x.getClientRects().length > 0 && !/^(hidden|submit|button|reset|image|file|checkbox|radio)$/i.test(x.type || '')).length : 0;
-  return {tag: e.tagName.toLowerCase(), hint: words.filter(Boolean).join(' '), others};
+  return {tag: e.tagName.toLowerCase(), hint: words.filter(Boolean).join(' '), others,
+          mark: e.getAttribute('data-handle-it-field')};
 }"""
 
-# The body's text, then the text of each open shadow root under it (depth first, document order).
+# The body's text, then the text of each open shadow root under it (depth first, document order). Nothing from a
+# frame that is not rendered (a display:none analytics frame): there innerText is textContent, scripts included.
 _READ_TEXT = r"""body => {
+  if (!body.getClientRects().length) return '';
   const parts = [body.innerText];
   const skip = /^(STYLE|SCRIPT|TEMPLATE|LINK|SLOT|NOSCRIPT)$/;
   const walk = (root) => {
@@ -138,6 +153,49 @@ _PRECHAT = r"""() => {
   });
 }"""
 
+# The page's corner chat bubble, which often has no name to find it by: a small element (or frame) in a bottom
+# corner, fixed or inside something fixed, on top where it sits, that it or a container up to the fixed one marks
+# as a chat by id, class, title, alt, label, address or its own short text; nothing on that way may be a CORNER_SKIP
+# control or a link that leaves the page (a WhatsApp or phone button). Marks it data-handle-it-launcher and says
+# whether it is a frame.
+_CORNER_LAUNCHER = r"""(body, [chat, skip]) => {
+  chat = new RegExp(chat, 'i'); skip = new RegExp(skip, 'i');
+  const up = (e) => e.parentElement || (e.getRootNode() instanceof ShadowRoot ? e.getRootNode().host : null);
+  const deep = (root, out = []) => {
+    for (const e of root.querySelectorAll('*')) { out.push(e); if (e.shadowRoot) deep(e.shadowRoot, out); }
+    return out;
+  };
+  const all = deep(document);
+  for (const e of all) e.removeAttribute('data-handle-it-launcher');
+  const W = innerWidth, H = innerHeight;
+  for (const e of all) {
+    const r = e.getBoundingClientRect();
+    if (r.width < 16 || r.height < 16 || r.width > 320 || r.height > 160 || r.top < H / 2 || r.bottom > H + 1 ||
+        r.bottom < H - 200 || (r.left > 200 && r.right < W - 200)) continue;
+    let hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    while (hit && hit.shadowRoot) {
+      const inner = hit.shadowRoot.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      if (!inner || inner === hit) break;
+      hit = inner;
+    }
+    while (hit && hit !== e) hit = up(hit);
+    if (!hit) continue;
+    const short = (e.innerText || '').trim();
+    const words = [short.length <= 60 ? short : ''];
+    let fixed = false, leaves = false;
+    for (let a = e; a && !fixed; a = up(a)) {
+      for (const n of ['id', 'class', 'title', 'alt', 'aria-label', 'src', 'href', 'name']) words.push(a.getAttribute(n) || '');
+      leaves = leaves || (a.tagName === 'A' && !/^\s*(#|javascript:|$)/i.test(a.getAttribute('href') || ''));
+      fixed = /^(fixed|sticky)$/.test(getComputedStyle(a).position);
+    }
+    const said = words.join(' ');
+    if (!fixed || leaves || skip.test(said) || !chat.test(said)) continue;
+    e.setAttribute('data-handle-it-launcher', '');
+    return e.tagName === 'IFRAME' ? 'frame' : 'element';
+  }
+  return null;
+}"""
+
 
 class BrowserUnavailable(RuntimeError):
     pass
@@ -188,7 +246,8 @@ def _chromium_candidates() -> list[str]:
     """Chromium builds to try when Playwright's own download is missing: Playwright's cache first
     (newest revision), then Hermes's AGENT_BROWSER_EXECUTABLE_PATH, then the PATH."""
     found: list[str] = []
-    cache = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or Path.home() / ".cache" / "ms-playwright")
+    default = Path.home() / ("Library/Caches" if sys.platform == "darwin" else ".cache") / "ms-playwright"
+    cache = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or default)
     def revision(p: Path) -> int:
         m = re.search(r"chromium-(\d+)", str(p))
         return int(m.group(1)) if m else 0
@@ -377,6 +436,15 @@ class Page:
     def _find_composer(self):
         best = None
         for frame in self._page.frames:
+            # Fields grouped with others around a submit control, with or without a <form>: a contact form's
+            # message box, not a chat's
+            crowded = set()
+            if self._readable(frame):
+                try:
+                    groups = frame.locator("body").evaluate(_PRECHAT, timeout=3000) or []
+                    crowded = {str(f["mark"]) for g in groups if len(g.get("fields") or []) > 1 for f in g["fields"]}
+                except Exception:
+                    pass
             for selector in COMPOSERS:
                 try:
                     loc = frame.locator(selector)
@@ -391,7 +459,7 @@ class Page:
                         info = el.evaluate(_COMPOSER_INFO, timeout=2000)
                     except Exception:
                         continue
-                    if info.get("others"):
+                    if info.get("others") or info.get("mark") in crowded:
                         continue
                     if COMPOSER_HINT.search(info.get("hint") or ""):
                         return el
@@ -406,7 +474,8 @@ class Page:
         def find():
             import time
 
-            deadline = time.time() + wait_s
+            start = time.time()
+            deadline = start + wait_s
             clicked = False
             refused = 0
             while time.time() < deadline:
@@ -418,7 +487,7 @@ class Page:
                     if refused < CONSENT_TRIES and self._refuse_consent():
                         refused += 1
                         self._page.wait_for_timeout(500)
-                    clicked = self._click_launcher()
+                    clicked = self._click_launcher(named=time.time() - start >= NAMED_LAUNCHER_AFTER_S)
                 self._page.wait_for_timeout(1000)
             return False
 
@@ -445,7 +514,33 @@ class Page:
         except Exception:
             return False
 
-    def _click_launcher(self) -> bool:
+    def _click_corner_launcher(self) -> bool:
+        main = self._page.main_frame
+        if not self._readable(main):
+            return False
+        try:
+            kind = main.locator("body").evaluate(_CORNER_LAUNCHER, [CORNER_CHAT, CORNER_SKIP], timeout=3000)
+            if not kind:
+                return False
+            target = main.locator("[data-handle-it-launcher]").first
+            if kind == "frame":  # clicked inside the bubble's own frame, and only one the guard would have loaded
+                frame = target.element_handle(timeout=2000).content_frame()
+                if frame is None or not self._readable(frame):
+                    return False
+                button = frame.get_by_role("button").first
+                target = button if button.is_visible() else frame.locator("body")
+            target.click(timeout=5000)
+            return True
+        except Exception:
+            return False
+
+    def _click_launcher(self, named: bool) -> bool:
+        # The corner bubble first: a page's own text also speaks of chats (an FAQ entry, a "Live chat" product
+        # link), and the first named match is often that and not the chat.
+        if self._click_corner_launcher():
+            return True
+        if not named:
+            return False
         for frame in self._page.frames:
             for role in ("button", "link"):
                 try:
