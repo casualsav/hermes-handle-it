@@ -1,8 +1,17 @@
+# cost: 6 machine-minutes per landing, removed by the maintainer
+# (the push and the pull request each run the Linux job, about 3 minutes; the macOS job runs only by hand)
 name: tests
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+concurrency:
+  group: tests-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -10,4 +19,18 @@ jobs:
           python-version: "3.11"
       - run: pip install pytest "playwright>=1.40,<2"
       - run: python -m playwright install --with-deps chromium
+      - run: python -m pytest -q tests
+  # The same suite on macOS, Chromium included. Runs only when started by hand
+  # (Actions → tests → Run workflow).
+  macos:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pytest "playwright>=1.40,<2"
+      - run: python -m playwright install chromium
       - run: python -m pytest -q tests

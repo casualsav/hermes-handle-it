@@ -18,12 +18,125 @@ from concurrent.futures import Future
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from . import netguard
+from . import netguard, prechat
 
-COMPOSERS = ("textarea", '[contenteditable="true"]', '[role="textbox"]', 'input[type="text"]', "input:not([type])")
+COMPOSERS = ("textarea", '[contenteditable="true"]', '[contenteditable=""]', '[contenteditable="plaintext-only"]',
+             '[role="textbox"]', 'input[type="text"]', "input:not([type])")
 COMPOSER_HINT = re.compile(r"message|type|chat|reply|write|ask|question", re.I)
-LAUNCHER = re.compile(r"(live chat|chat with|chat now|start (a )?chat|message us|contact support|talk to|^chat$|get help)", re.I)
+# A short button or link name that speaks of a chat and is not a close, minimise, end or transcript control.
+# Playwright hands the pattern to the page's JavaScript, so it uses only syntax both languages read alike.
+LAUNCHER = re.compile(
+    r"^(?!.*(close|minimi[sz]e|\bend\b|hide|leave|history|download|transcript|e-?mail))(?=.{1,60}$)"
+    r".*(\b(live)?chat|messenger|messaging|message us|contact support|talk to|get help)", re.I)
+# Consent banners are only ever refused: agreeing to tracking is not the plugin's to give.
+REFUSE_CONSENT = re.compile(
+    r"^\s*((reject|decline|deny|refuse)( all)?( cookies)?|(necessary|essential)( cookies)? only|only necessary( cookies)?"
+    r"|use necessary cookies only)\s*$", re.I)
+CONSENT_TRIES = 3
+# A frame that is a chat widget by its address or name; a form in any other place must speak of a chat itself.
+WIDGET_FRAME = re.compile(r"chat|messag|messenger|conversation", re.I)
 SEND = re.compile(r"^\s*send\b|^submit$", re.I)
+
+# Per element: the words that name it (attributes and label text), its tag, and how many other visible
+# fields share its <form>; a field among others is a form's field, not a chat's message box.
+_COMPOSER_INFO = r"""e => {
+  const words = [e.getAttribute('aria-label'), e.getAttribute('placeholder'), e.getAttribute('name'), e.id];
+  for (const label of e.labels || []) words.push(label.innerText);
+  for (const id of (e.getAttribute('aria-labelledby') || '').split(/\s+/)) {
+    const label = id && e.getRootNode().getElementById(id);
+    if (label) words.push(label.innerText);
+  }
+  const form = e.closest('form');
+  const others = form ? Array.from(form.querySelectorAll('input, select, textarea')).filter((x) => x !== e &&
+    x.getClientRects().length > 0 && !/^(hidden|submit|button|reset|image|file|checkbox|radio)$/i.test(x.type || '')).length : 0;
+  return {tag: e.tagName.toLowerCase(), hint: words.filter(Boolean).join(' '), others};
+}"""
+
+# The body's text, then the text of each open shadow root under it (depth first, document order).
+_READ_TEXT = r"""body => {
+  const parts = [body.innerText];
+  const skip = /^(STYLE|SCRIPT|TEMPLATE|LINK|SLOT|NOSCRIPT)$/;
+  const walk = (root) => {
+    for (const host of root.querySelectorAll('*')) {
+      if (!host.shadowRoot) continue;
+      const text = [];
+      for (const node of host.shadowRoot.childNodes) {
+        if (node.nodeType === 3 && host.getClientRects().length && node.textContent.trim()) text.push(node.textContent.trim());
+        if (node.nodeType === 1 && !skip.test(node.tagName) && node.getClientRects().length) text.push(node.innerText);
+      }
+      const chunk = text.join('\n');
+      if (chunk.trim() && !parts.join('\n').includes(chunk)) parts.push(chunk);
+      walk(host.shadowRoot);
+    }
+  };
+  walk(body);
+  return parts.join('\n');
+}"""
+
+# The pre-chat form groups of one frame: visible fields that share a <form> (or the nearest container) with a
+# visible submit control named like "Start chat". Each field and submit control gets a data-handle-it-* mark so
+# Playwright can find it again in the same call. ``chat`` says the form or its button speaks of a chat.
+_PRECHAT = r"""() => {
+  const SUBMIT = /^\W*(start (the |a )?chat(ting)?|begin (the |a )?chat|start (a |the )?conversation|chat now|continue|next|submit|send)\W*$/i;
+  const IGNORE = /search|newsletter|subscribe|password|coupon/i;
+  const SIGN_IN = /\b(username|current-password|new-password|one-time-code)\b/i;
+  const deep = (root, sel, out = []) => {
+    out.push(...root.querySelectorAll(sel));
+    for (const el of root.querySelectorAll('*')) if (el.shadowRoot) deep(el.shadowRoot, sel, out);
+    return out;
+  };
+  const visible = (e) => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
+  const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+  const kind = (e) => {
+    const tag = e.tagName.toLowerCase();
+    if (tag === 'textarea' || tag === 'select') return tag;
+    const t = (e.getAttribute('type') || 'text').toLowerCase();
+    if (t === 'email' || t === 'tel' || t === 'checkbox') return t;
+    return (t === 'text' || t === 'number' || t === 'url') ? 'text' : null;
+  };
+  const labelOf = (e) => {
+    let text = e.getAttribute('aria-label');
+    if (!text && e.labels && e.labels.length) text = e.labels[0].innerText;
+    if (!text) text = (e.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+      .map((id) => { const l = e.getRootNode().getElementById(id); return l ? l.innerText : ''; }).join(' ');
+    return clean(text || e.getAttribute('placeholder') || e.getAttribute('name') || e.id || kind(e));
+  };
+  const fields = deep(document, 'input, textarea, select').filter((e) => kind(e) && !e.disabled && !e.readOnly &&
+    visible(e) && !IGNORE.test([labelOf(e), e.getAttribute('name'), e.id, e.getAttribute('placeholder')].join(' ')));
+  if (!fields.length) return [];
+  const groups = [];
+  for (const b of deep(document, 'button, input[type="submit"], input[type="button"], [role="button"]')) {
+    if (!visible(b) || b.disabled || !SUBMIT.test(clean(b.getAttribute('aria-label') || b.innerText || b.value))) continue;
+    let box = b.form || b.closest('form');
+    if (!box) {
+      box = b.parentElement;
+      while (box && !fields.some((f) => box.contains(f))) box = box.parentElement;
+      if (box && (box === document.body || box === document.documentElement) && window.top === window) continue;
+    }
+    if (!box || groups.some((g) => g.box === box)) continue;
+    const own = fields.filter((f) => f.form === box || box.contains(f));
+    const signIn = deep(box, 'input').some((i) => visible(i) &&
+      (i.type === 'password' || SIGN_IN.test(i.getAttribute('autocomplete') || '')));
+    if (own.length && !signIn) groups.push({box, submit: b, fields: own});
+  }
+  for (const e of deep(document, '[data-handle-it-field], [data-handle-it-submit]')) {
+    e.removeAttribute('data-handle-it-field');
+    e.removeAttribute('data-handle-it-submit');
+  }
+  const marks = new Map();
+  return groups.map((g, gi) => {
+    g.submit.setAttribute('data-handle-it-submit', String(gi));
+    const named = clean(g.submit.getAttribute('aria-label') || g.submit.innerText || g.submit.value);
+    return {submit: gi, chat: /chat|conversation/i.test((g.box.innerText || '') + ' ' + named), fields: g.fields.map((f) => {
+      if (!marks.has(f)) { marks.set(f, marks.size); f.setAttribute('data-handle-it-field', String(marks.get(f))); }
+      const label = labelOf(f);
+      const options = f.tagName === 'SELECT' ? Array.from(f.options).filter((o) => !o.disabled && !o.hidden && o.value !== '')
+        .map((o) => clean(o.label || o.text)).filter(Boolean) : [];
+      return {mark: marks.get(f), label: label.replace(/\s*\*\s*$/, ''), type: kind(f), options,
+              required: !!f.required || f.getAttribute('aria-required') === 'true' || /\*\s*$/.test(label)};
+    })};
+  });
+}"""
 
 
 class BrowserUnavailable(RuntimeError):
@@ -47,7 +160,10 @@ class _Guard:
             {"urlPattern": "*", "resourceType": "Document", "requestStage": "Request"}]})
 
     def _paused(self, event: dict) -> None:
-        why = netguard.refusal(str((event.get("request") or {}).get("url") or ""))
+        try:
+            why = netguard.refusal(str((event.get("request") or {}).get("url") or ""))
+        except Exception as exc:  # fail closed: a request is never left paused or let through unchecked
+            why = f"an address the guard could not check ({type(exc).__name__})"
         try:
             if why:
                 self.refused.append(why)
@@ -225,14 +341,33 @@ class Page:
         self._b = browser
         self._page = page
 
+    def _readable(self, frame) -> bool:
+        """False for a frame the guard would not have loaded; such a frame is never read or filled."""
+        try:
+            return not netguard.refusal(frame.url)
+        except Exception:
+            return False
+
     def text(self) -> str:
+        """Each frame's text: its body, then any open shadow roots (closed ones and canvas stay unreadable)."""
+
         def read():
             parts = []
             for frame in self._page.frames:
-                if netguard.refusal(frame.url):
-                    continue  # never read a frame the guard would not have loaded
+                if not self._readable(frame):
+                    continue
+                body = frame.locator("body")
                 try:
-                    parts.append(frame.locator("body").inner_text(timeout=3000))
+                    got = body.evaluate(_READ_TEXT, timeout=3000)
+                    if not isinstance(got, str):
+                        raise TypeError("no text")
+                    parts.append(got)
+                    continue
+                except Exception as exc:
+                    if type(exc).__name__ == "TimeoutError":
+                        continue
+                try:
+                    parts.append(body.inner_text(timeout=3000))
                 except Exception:
                     continue
             return "\n".join(parts)
@@ -253,44 +388,88 @@ class Page:
                     try:
                         if not el.is_visible() or not el.is_editable():
                             continue
-                        hint = " ".join(filter(None, (el.get_attribute("aria-label"), el.get_attribute("placeholder"),
-                                                      el.get_attribute("name"), el.get_attribute("id"))))
+                        info = el.evaluate(_COMPOSER_INFO, timeout=2000)
                     except Exception:
                         continue
-                    if COMPOSER_HINT.search(hint):
+                    if info.get("others"):
+                        continue
+                    if COMPOSER_HINT.search(info.get("hint") or ""):
                         return el
-                    best = best or el
+                    if info.get("tag") != "input":  # an unnamed <input> is a form field far more often than a chat box
+                        best = best or el
         return best
 
     def find_composer(self, open_chat: bool = True, wait_s: float = 20.0) -> bool:
-        """True once a message box is on the page; clicks a chat launcher when there is none."""
+        """True once a message box is on the page; clicks a chat launcher when there is none, after refusing
+        any cookie banner that may cover it."""
 
         def find():
             import time
 
             deadline = time.time() + wait_s
             clicked = False
+            refused = 0
             while time.time() < deadline:
                 if self._find_composer() is not None:
                     return True
+                if clicked and self._prechat_groups():
+                    return False  # the chat opened on a pre-chat form: the caller fills it
                 if open_chat and not clicked:
+                    if refused < CONSENT_TRIES and self._refuse_consent():
+                        refused += 1
+                        self._page.wait_for_timeout(500)
                     clicked = self._click_launcher()
                 self._page.wait_for_timeout(1000)
             return False
 
         return self._b.run(find, timeout=wait_s + 30)
 
+    def _first_visible(self, role: str, name: "re.Pattern"):
+        for frame in self._page.frames:
+            try:
+                loc = frame.get_by_role(role, name=name)
+                for i in range(min(loc.count(), 10)):
+                    if loc.nth(i).is_visible():
+                        return loc.nth(i)
+            except Exception:
+                continue
+        return None
+
+    def _refuse_consent(self) -> bool:
+        button = self._first_visible("button", REFUSE_CONSENT)
+        if button is None:
+            return False
+        try:
+            button.click(timeout=5000)
+            return True
+        except Exception:
+            return False
+
     def _click_launcher(self) -> bool:
         for frame in self._page.frames:
             for role in ("button", "link"):
                 try:
                     loc = frame.get_by_role(role, name=LAUNCHER)
-                    if loc.count() and loc.first.is_visible():
-                        loc.first.click(timeout=5000)
-                        return True
+                    for i in range(min(loc.count(), 10)):
+                        if loc.nth(i).is_visible():
+                            loc.nth(i).click(timeout=5000)
+                            return True
                 except Exception:
                     continue
         return False
+
+    @staticmethod
+    def _holds(box, message: str) -> bool:
+        """True while the message box still holds ``message``."""
+        want = " ".join(message.split())
+        if not want:
+            return False
+        try:
+            left = box.input_value(timeout=1000) if box.evaluate("e => 'value' in e", timeout=1000) \
+                else box.inner_text(timeout=1000)
+        except Exception:
+            return False
+        return want in " ".join(left.split())
 
     def send(self, message: str) -> None:
         def type_and_send():
@@ -298,22 +477,100 @@ class Page:
             if box is None:
                 raise RuntimeError("The chat's message box is gone (the chat may have closed).")
             box.click(timeout=5000)
-            box.fill(message, timeout=10000)
+            try:
+                box.fill(message, timeout=10000)
+            except Exception:  # some rich editors refuse fill; typing reaches them
+                box.click(timeout=5000)
+                box.press_sequentially(message, timeout=30000)
             box.press("Enter")
             self._page.wait_for_timeout(800)
-            left = ""
-            try:
-                left = box.input_value(timeout=1000) if box.evaluate("e => 'value' in e") else box.inner_text(timeout=1000)
-            except Exception:
-                pass
-            if left.strip():
-                for f in self._page.frames:
+            if not self._holds(box, message):
+                return
+            for f in self._page.frames:
+                try:
                     btn = f.get_by_role("button", name=SEND)
                     if btn.count():
                         btn.first.click(timeout=5000)
+                        self._page.wait_for_timeout(800)
                         break
+                except Exception:
+                    continue
+            if self._holds(box, message):
+                raise RuntimeError("The message did not send: it is still in the chat's message box, and neither "
+                                   "Enter nor a Send button sent it.")
 
         self._b.run(type_and_send, timeout=60)
+
+    def _prechat_groups(self) -> list:
+        """``(frame, group)`` for every pre-chat form group, best first: inside an iframe, then mentioning chat.
+        Only a form that speaks of a chat, or sits in a chat widget's frame, counts: a contact or newsletter
+        form on the same page is never filled."""
+        found = []
+        main = self._page.main_frame
+        for frame in self._page.frames:
+            if not self._readable(frame):
+                continue
+            try:
+                groups = frame.locator("body").evaluate(_PRECHAT, timeout=3000)
+            except Exception:
+                continue
+            widget = frame is not main and bool(WIDGET_FRAME.search(f"{frame.url} {frame.name}"))
+            found.extend((frame, g) for g in groups or [] if g.get("fields") and (g.get("chat") or widget))
+        found.sort(key=lambda fg: (fg[0] is main, not fg[1].get("chat")))
+        return found
+
+    def prechat_fields(self) -> list[dict]:
+        """The visible pre-chat form's fields, ``[]`` when there is none (or the message box is already there).
+        Each: ``{"label", "type", "required", "options"}``."""
+
+        def read():
+            if self._find_composer() is not None:
+                return []
+            groups = self._prechat_groups()
+            if not groups:
+                return []
+            return [{"label": str(f.get("label") or ""), "type": str(f.get("type") or "text"),
+                     "required": bool(f.get("required")), "options": [str(o) for o in f.get("options") or []]}
+                    for f in groups[0][1]["fields"]]
+
+        return self._b.run(read, timeout=60)
+
+    def fill_prechat(self, values: dict[str, str]) -> bool:
+        """Fills the fields whose label is a key of ``values`` and presses the form's submit button; True
+        when it was pressed."""
+
+        def fill():
+            if self._find_composer() is not None:
+                return False
+            groups = self._prechat_groups()
+            if not groups:
+                return False
+            frame, group = groups[0]
+            for field in group["fields"]:
+                label = str(field.get("label") or "")
+                if label not in values:
+                    continue
+                value = str(values[label])
+                el = frame.locator(f'[data-handle-it-field="{int(field["mark"])}"]').first
+                try:
+                    if field.get("type") == "select":
+                        choice = next((o for o in field.get("options") or [] if o.lower() == value.strip().lower()), None)
+                        if choice is not None:
+                            el.select_option(label=choice, timeout=5000)
+                    elif field.get("type") == "checkbox":
+                        if prechat.yes_like(value):
+                            el.check(timeout=5000)
+                    else:
+                        el.fill(value, timeout=5000)
+                except Exception:
+                    continue
+            try:
+                frame.locator(f'[data-handle-it-submit="{int(group["submit"])}"]').first.click(timeout=5000)
+                return True
+            except Exception:
+                return False
+
+        return self._b.run(fill, timeout=90)
 
     def screenshot(self, path: Path) -> Optional[str]:
         def shoot():

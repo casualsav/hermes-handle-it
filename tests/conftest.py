@@ -28,13 +28,21 @@ _load()
 
 
 class FakeCtx:
-    """The parts of Hermes's PluginContext the plugin uses: settings, ``emit`` and ``dispatch_tool``
-    (which runs Hermes's clarify tool with the callback given)."""
+    """The parts of Hermes's PluginContext the plugin uses: settings, ``emit``, ``dispatch_tool``
+    (which runs Hermes's clarify tool with the callback given) and the tool and hook registrations."""
 
     def __init__(self, settings=None):
         self.settings = dict(settings or {})
         self.events = []
         self.dispatched = []
+        self.tools = []
+        self.hooks = []
+
+    def register_tool(self, name, toolset, schema, handler, **kwargs):
+        self.tools.append((name, toolset, handler))
+
+    def register_hook(self, name, callback):
+        self.hooks.append((name, callback))
 
     def get_config(self, key, default=None):
         return self.settings.get(key, default)

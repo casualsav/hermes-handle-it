@@ -13,6 +13,7 @@ from typing import Optional
 
 from . import handlers
 from .bland import Bland, BlandError
+from .guard import _norm
 from .phone import Bridge, CallSession
 
 _calls: dict[str, CallSession] = {}
@@ -89,9 +90,18 @@ def _plan(args: dict) -> tuple[Optional[dict], Optional[str]]:
         minutes = max(1, min(int(args.get("max_minutes") or 30), 120))
     except (TypeError, ValueError):
         minutes = 30
-    return {"number": number, "company": str(args.get("company") or "").strip(), "task": task,
+    plan = {"number": number, "company": str(args.get("company") or "").strip(), "task": task,
             "shareable": {str(k): str(v) for k, v in shareable.items()}, "never": [str(v) for v in never],
-            "minutes": minutes, "record": bool(args.get("record"))}, None
+            "minutes": minutes, "record": bool(args.get("record"))}
+    # task, company and shareable become the instructions bland.ai's agent gets; never_share stays here
+    sent = {"task": [plan["task"]], "company": [plan["company"]],
+            "shareable": [p for kv in plan["shareable"].items() for p in kv]}
+    secret = [n for n in (_norm(v) for v in plan["never"]) if n]
+    leaks = [field for field, parts in sent.items() if any(n in _norm(p) for p in parts for n in secret)]
+    if leaks:
+        return None, (f"Not placed: {' and '.join(leaks)} contain{'s' if len(leaks) == 1 else ''} a never_share value, "
+                      "and they go to bland.ai. Restate the call without it.")
+    return plan, None
 
 
 def _fingerprint(plan: dict) -> str:
@@ -106,9 +116,11 @@ def pre_tool_call(tool_name: str = "", args: Optional[dict] = None, **_kw):
     plan, _ = _plan(args)
     if plan is None:
         return None  # the tool reports what is wrong; it places nothing
+    labels = ", ".join(plan["shareable"])  # the labels only: the values stay out of the prompt and its logs
     question = (f"Place a phone call through bland.ai to {plan['company'] or 'a support line'} at {plan['number']}? "
                 f"Up to {plan['minutes']} minutes, {'recorded' if plan['record'] else 'not recorded'}; "
-                f"bland.ai bills the call to your account. Goal: {plan['task'][:200]}")
+                f"bland.ai bills the call to your account. Goal: {plan['task'][:200]} "
+                + (f"It may share: {labels}." if labels else "It shares none of your details."))
     if handlers._approvals_off():
         return {"action": "block", "message": json.dumps({
             "status": "needs_user", "question": question,
@@ -122,6 +134,18 @@ def pre_tool_call(tool_name: str = "", args: Optional[dict] = None, **_kw):
         _approved[key] = now
     # A fresh rule key per call: an "always" answer never waves through a later, different call.
     return {"action": "approve", "message": question, "rule_key": f"support_call:{key[:16]}:{time.time_ns()}"}
+
+
+def post_tool_call(tool_name: str = "", args: Optional[dict] = None, status: str = "", error_message: str = "",
+                   **_kw) -> None:
+    """Hermes's gate refused the call or nobody answered: forget the plan ``pre_tool_call`` recorded,
+    so only a fresh yes places it."""
+    if tool_name != "support_call_start" or status != "blocked" or not isinstance(args, dict):
+        return
+    plan, _ = _plan(args)
+    if plan is not None:
+        with _approved_lock:
+            _approved.pop(_fingerprint(plan), None)
 
 
 def _take_approval(plan: dict) -> bool:
@@ -153,12 +177,20 @@ def start(args: dict, parent_agent=None, **_kw) -> str:
     except BlandError as exc:
         if _bridge is not None:
             _bridge.calls.pop(call.id, None)
+        if exc.maybe_sent:  # retrying could place a second paid call
+            return handlers._err(
+                "bland.ai did not answer in time, so the call may or may not have been placed. Do NOT place it "
+                "again: tell the user to check their bland.ai call log (app.bland.ai) and end the call there if "
+                "it is running.", detail=str(exc))
         return handlers._err(str(exc))
     with handlers._lock:
         _calls[call.id] = call
     call.progress(f"Calling {call.company or number}…")
     out = call.follow(_bland(), handlers._asker(parent_agent), max_wait_s=_wait_s(args))
     out["session_id"] = call.id
+    # Hermes's gate can answer yes with nobody asked (yolo), and the plugin cannot tell: say it every time.
+    out["tell_user"] = (f"A call to {call.company or 'the support line'} at {number} has been placed; bland.ai bills "
+                        "it to the user's account. Say so in your next message to the user.")
     if not url:
         out["note"] = ("No approval bridge is set up (the call_bridge_url setting), so the call agrees to nothing: "
                        "it brings back any offer for the user to decide.")
@@ -184,6 +216,8 @@ def end(args: dict, parent_agent=None, **_kw) -> str:
         _calls.pop(call.id, None)
     if _bridge is not None:
         _bridge.calls.pop(call.id, None)
+    if result.get("hangup") == "failed":
+        call.progress("Could not hang up: the call may still be running. End it in bland.ai's dashboard.")
     call.progress(f"Call closed. Transcript: {result['transcript_file']}")
     return handlers._ok(result)
 

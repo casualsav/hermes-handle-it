@@ -2,7 +2,10 @@
 
     python demo/serve.py [--port 8765]
 
-Add ?speed=0.2 to the URL to make the scripted agent answer faster.
+Add ?speed=0.2 to the URL to make the scripted agent answer faster. Other options, combinable:
+?login=1 (or ?login=2fa) puts the chat behind a sign-in, ?prechat=1 asks for a name and email first,
+and /widget.html serves the chat in an iframe behind a launcher, where ?cookies=1 covers the
+launcher with a cookie banner.
 """
 
 import argparse

@@ -25,15 +25,18 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .bland import Bland
-from .guard import Guard
+from .guard import Guard, _norm
 from .session import HOLD, Ask, Progress, Turn, _nothing
 
 YES = "Yes, go ahead"
 NO = "No: keep working toward the goal"
 END_CALL = "End the call"
-HOLD_S = 45.0  # bland.ai gives a tool at most 60 s; answer "pending" before that
+# bland.ai documents a 1-60 s timeout range only for saved tools; for the inline tool sent here no
+# maximum is documented, so answer "pending" well inside 60 s
+HOLD_S = 45.0
 POLL_S = 3.0
 SETTLE_S = 45.0  # how long to wait for the price and summary after the call ends
+READ_FAILURES = 5  # reads of the call failing in a row before following it stops: a revoked key or an outage
 TOOL = "CheckWithAccountHolder"
 WHO = {"user": "support", "assistant": "you"}
 
@@ -61,6 +64,8 @@ class CallSession:
         self.ended = False
         self.closed = False
         self.progress: Progress = _nothing
+        self._read_failures = 0
+        self._read_error = ""
         self._clock, self._sleep, self._poll, self._hold = clock, sleep, poll_s, hold_s
         self._cv = threading.Condition()
 
@@ -97,6 +102,8 @@ class CallSession:
                 f"- pending: tell them you are still checking with the account holder, thank them for holding, "
                 f"then use {TOOL} again with the same words;",
                 "- stop: thank them, say the account holder will follow up, and end the call.",
+                f"If {TOOL} fails, times out or returns no decision from this list, you have no answer: agree to "
+                "nothing, share nothing new, and say the account holder will follow up.",
             ]
         else:
             lines += [
@@ -148,9 +155,13 @@ class CallSession:
     # --- the bridge side: a request from the call ---------------------------------------
 
     def check(self, they_said: str, you_would_say: str) -> dict:
-        """bland.ai's agent asks before it says yes. Holds up to ``hold_s`` for the user's answer."""
+        """bland.ai's agent asks before it says yes. Holds up to ``hold_s`` for the user's answer.
+        A question is its words: asking again with the same words (after ``pending``) is the same
+        question, different words a new one, so an answer never reaches an offer it was not given to."""
+        key = _same(they_said, you_would_say)
         with self._cv:
-            q = next((q for q in self.questions if not q.get("delivered")), None)
+            q = next((q for q in self.questions
+                      if not q.get("delivered") and _same(q["they_said"], q["you_would_say"]) == key), None)
             if q is None:
                 findings = self.guard.check(you_would_say or "", "agree")
                 q = {"they_said": they_said, "you_would_say": you_would_say,
@@ -180,7 +191,7 @@ class CallSession:
         while True:
             heard += self._read(client)
             self._answer_questions(ask)
-            if self.ended or self._clock() - start >= max_wait_s:
+            if self.ended or self._read_failures >= READ_FAILURES or self._clock() - start >= max_wait_s:
                 break
             self._sleep(self._poll)
         # bland.ai marks a call completed before it has priced and summarised it
@@ -199,6 +210,11 @@ class CallSession:
             out["hint"] = "Still on the call. Call support_call_wait to keep following it."
         if not self.bridged and self.ended:
             out["decide"] = "Nothing was agreed on the call. Tell the user any offer support made and let them decide."
+        if not self.ended and self._read_failures >= READ_FAILURES:
+            out["read_error"] = self._read_error
+            out["detail"] = (f"The call's state could not be read from bland.ai ({self._read_failures} tries in a row), "
+                             "so the call may still be running. Tell the user. support_call_end tries to hang up; "
+                             "otherwise it runs until its max-minutes cap or until it is ended in bland.ai's dashboard.")
         return out
 
     def _read(self, client: Bland) -> list[str]:
@@ -207,8 +223,11 @@ class CallSession:
         try:
             data = client.call(self.call_id)
         except Exception as exc:
+            self._read_failures += 1
+            self._read_error = str(exc) or type(exc).__name__
             self.progress(f"Could not read the call: {exc}")
             return []
+        self._read_failures = 0
         self.details = {k: v for k, v in data.items() if k not in ("transcripts", "concatenated_transcript")}
         heard = []
         for line in data.get("transcripts") or []:
@@ -255,13 +274,27 @@ class CallSession:
     # --- ending and saving ---------------------------------------------------------------
 
     def finish(self, client: Bland, outcome: str, resolved: bool) -> dict:
+        still_on = None  # why hanging up failed, while the call may still be running
         if not self.ended and self.call_id:
-            try:
-                client.stop(self.call_id)
-                self.turns.append(Turn("note", "Hung up."))
-            except Exception as exc:
-                self.turns.append(Turn("note", f"Could not hang up: {exc}"))
+            error = None
+            for attempt in range(2):
+                try:
+                    client.stop(self.call_id)
+                    error = None
+                    break
+                except Exception as exc:
+                    error = str(exc) or type(exc).__name__
+                    if attempt == 0:
+                        self._sleep(self._poll)
             self._read(client)
+            if error is None:
+                self.turns.append(Turn("note", "Hung up."))
+            elif self.ended:
+                self.turns.append(Turn("note", f"Could not hang up ({error}), but the call had already ended."))
+            else:
+                still_on = (f"Could not hang up, tried twice ({error}). The call may still be running, billed until its "
+                            f"{self.max_minutes}-minute cap; end it in bland.ai's dashboard (app.bland.ai).")
+                self.turns.append(Turn("note", still_on))
         with self._cv:
             for q in self.questions:  # a request still held gets its answer: the call is over
                 if q["answer"] is None:
@@ -286,14 +319,20 @@ class CallSession:
                 body.append(f"- **{label}:** {self.details[key]}")
         if audit:
             body.append("- **Check:** " + "; ".join(audit))
+        if still_on:
+            body.append(f"- **Hang-up failed:** {still_on}")
         names = {"support": "Support", "you": "Hermes, for you", "note": "Note"}
         body += ["", "## Transcript", "", "```",
                  "\n".join(f"[{t.at[11:19]}] {names[t.who]}: {t.text}" for t in self.turns), "```", ""]
         path.write_text("\n".join(body), encoding="utf-8")
         self.closed = True
         self.save()
-        return {"status": "closed", "outcome": outcome, "resolved": resolved, "transcript_file": str(path),
-                "approvals": self.approvals, "check": audit, "price": self.details.get("price")}
+        out = {"status": "closed", "outcome": outcome, "resolved": resolved, "transcript_file": str(path),
+               "approvals": self.approvals, "check": audit, "price": self.details.get("price")}
+        if still_on:
+            out["hangup"] = "failed"
+            out["detail"] = "Tell the user right away. " + still_on
+        return out
 
     def audit(self) -> list[str]:
         """What the call's agent said that the user had not allowed: details off the list, and a yes
@@ -339,6 +378,10 @@ class CallSession:
             if t.who == "support":
                 s.guard.heard.append(t.text)
         return s
+
+
+def _same(they_said: str, you_would_say: str) -> tuple[str, str]:
+    return _norm(they_said or ""), _norm(you_would_say or "")
 
 
 def _question(q: dict) -> str:

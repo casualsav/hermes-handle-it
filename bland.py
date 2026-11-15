@@ -8,6 +8,7 @@ tests run.
 
 from __future__ import annotations
 
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -17,7 +18,12 @@ API = "https://api.bland.ai"
 
 
 class BlandError(RuntimeError):
-    pass
+    """``maybe_sent``: a POST reached bland.ai but no usable answer came back, so whatever it asked
+    for (a paid call) may have happened. Never retried."""
+
+    def __init__(self, message: str, maybe_sent: bool = False) -> None:
+        super().__init__(message)
+        self.maybe_sent = maybe_sent
 
 
 def _scoped_key() -> str:
@@ -50,14 +56,29 @@ class Bland:
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.base + path, data=data, method=method,
                                      headers={"authorization": key, "content-type": "application/json"})
+        sent = method == "POST"
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                return json.loads(resp.read() or b"{}")
+                raw = resp.read()
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")[:500]
+            try:
+                detail = exc.read().decode("utf-8", "replace")[:500]
+            except Exception:
+                detail = ""
             raise BlandError(f"bland.ai {method} {path} answered {exc.code}: {detail}") from None
-        except urllib.error.URLError as exc:
+        except urllib.error.URLError as exc:  # raised only while connecting or sending: no whole request arrived
             raise BlandError(f"bland.ai is unreachable: {exc.reason}") from None
+        except (OSError, http.client.HTTPException) as exc:  # sent, then a timeout or a dropped connection
+            raise BlandError(f"bland.ai did not answer {method} {path}: {exc or type(exc).__name__}",
+                             maybe_sent=sent) from None
+        try:
+            out = json.loads(raw or b"{}")
+        except ValueError:
+            out = None
+        if not isinstance(out, dict):
+            raise BlandError(f"bland.ai answered {method} {path} with something that is not a JSON object.",
+                             maybe_sent=sent)
+        return out
 
     def send_call(self, payload: dict) -> str:
         out = self._request("POST", "/v1/calls", payload)

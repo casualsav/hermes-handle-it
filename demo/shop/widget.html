@@ -11,6 +11,12 @@
               border-radius: 24px; padding: 12px 20px; font: inherit; cursor: pointer; }
   #frame { position: fixed; right: 24px; bottom: 80px; width: 420px; height: 640px; border: 0;
            border-radius: 12px; box-shadow: 0 6px 24px rgba(0,0,0,.2); background: #fff; display: none; }
+  #consent { position: fixed; left: 0; right: 0; bottom: 0; z-index: 10; min-height: 120px; background: #fff;
+             box-shadow: 0 -4px 18px rgba(0,0,0,.15); padding: 20px 24px; display: flex; align-items: center; gap: 12px; }
+  #consent[hidden] { display: none; }
+  #consent p { flex: 1; margin: 0; }
+  #consent button { border: 1px solid #1f5f4a; border-radius: 8px; padding: 10px 16px; font: inherit; cursor: pointer;
+                    background: #fff; color: #1f5f4a; }
 </style>
 </head>
 <body>
@@ -19,15 +25,29 @@
   <h2>Your orders</h2>
   <p>Order #1234 · Ridgeline rain jacket · delivered.</p>
   <p style="color:#6b7378;font-size:13px">Demo page: the support chat lives in an embedded widget, the way Intercom or Zendesk embed theirs.</p>
+  <p id="consent-choice"></p>
 </main>
 <button id="launcher" type="button">Chat with us</button>
 <iframe id="frame" title="Support chat"></iframe>
+<!-- ?cookies=1 shows a consent banner over the launcher, as many shops do. -->
+<div id="consent" role="dialog" aria-label="Cookie consent" hidden>
+  <p>We use cookies to run this shop and, with your consent, to measure visits.</p>
+  <button id="consent-accept" type="button">Accept all</button>
+  <button id="consent-reject" type="button">Reject all</button>
+</div>
 <script>
   document.getElementById("launcher").addEventListener("click", () => {
     const f = document.getElementById("frame");
     if (!f.src) f.src = "index.html" + location.search;
     f.style.display = "block";
   });
+  document.getElementById("consent").hidden = !new URLSearchParams(location.search).get("cookies");
+  for (const [id, choice] of [["consent-accept", "accepted"], ["consent-reject", "rejected"]]) {
+    document.getElementById(id).addEventListener("click", () => {
+      document.getElementById("consent").hidden = true;
+      document.getElementById("consent-choice").textContent = "Cookie choice: " + choice + ".";
+    });
+  }
 </script>
 </body>
 </html>

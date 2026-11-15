@@ -30,10 +30,11 @@
   textarea { flex: 1; resize: none; height: 44px; padding: 10px; border: 1px solid #cfc9bb; border-radius: 8px; font: inherit; }
   button { background: var(--brand); color: #fff; border: 0; border-radius: 8px; padding: 0 16px; font: inherit; cursor: pointer; }
   button:disabled { opacity: .5; cursor: default; }
-  #signin { display: flex; flex-direction: column; gap: 8px; padding: 16px; flex: 1; border: 0; }
-  #signin[hidden] { display: none; }
-  #signin input { padding: 10px; border: 1px solid #cfc9bb; border-radius: 8px; font: inherit; }
-  #signin button { padding: 10px; }
+  #signin, #prechat { display: flex; flex-direction: column; gap: 8px; padding: 16px; flex: 1; border: 0; }
+  #signin[hidden], #prechat[hidden] { display: none; }
+  #signin input, #prechat input { padding: 10px; border: 1px solid #cfc9bb; border-radius: 8px; font: inherit; }
+  #signin button, #prechat button { padding: 10px; }
+  #prechat label { font-size: 13px; color: var(--muted); margin-bottom: -4px; }
   @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -56,6 +57,17 @@
       <input id="code" autocomplete="one-time-code" aria-label="Verification code" placeholder="6-digit code we sent you" hidden>
       <button type="submit">Sign in</button>
       <p id="signin-error" style="color:#b3261e;font-size:13px;margin:6px 0 0"></p>
+    </form>
+    <form id="prechat" hidden>
+      <p style="margin:0 0 8px"><b>Tell us a little about you to start a chat</b></p>
+      <label for="pc-name">Name</label>
+      <input id="pc-name" name="name" type="text" autocomplete="name" required>
+      <label for="pc-email">Email</label>
+      <input id="pc-email" name="email" type="email" autocomplete="email" required>
+      <label for="pc-order">Order number</label>
+      <input id="pc-order" name="order" type="text">
+      <button type="submit">Start chat</button>
+      <p id="prechat-error" style="color:#b3261e;font-size:13px;margin:6px 0 0"></p>
     </form>
     <div class="log" id="log" role="log" aria-live="polite" aria-label="Chat messages"></div>
     <div class="typing" id="typing" aria-live="polite"></div>
