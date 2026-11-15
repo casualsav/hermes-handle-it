@@ -2,7 +2,7 @@
 
 import json
 
-from support_chat_plugin.session import ACCEPT_OFFER, APPROVE, DECLINE_OFFER, DENY, FOLLOW_UP, HOLD, ChatSession
+from support_chat_plugin.session import ACCEPT_OFFER, APPROVE, DECLINE_OFFER, DENY, FOLLOW_UP, HOLD, STOP, ChatSession
 
 
 class Clock:
@@ -266,3 +266,153 @@ def test_a_block_that_is_not_a_timeout_does_not_end_the_chat(tmp_path):
     s, page = _offer_on_the_gate(tmp_path)
     s.approval_refused("Yes, I'll take the $36 partial refund.", "BLOCKED: Failed to send approval request to user.")
     assert s.pending is None and not s.closed and page.sent == [HOLD]
+
+
+# --- G4: a question back keeps the offer open ------------------------------------------------
+
+def test_an_offer_stays_open_across_a_question_back(tmp_path):
+    s, page, clock = session(tmp_path, {"expiry": (3.0, "It expires in 30 days.")})
+    s.wait_for_reply()
+    page.lines += ["Dana", "I can offer a $36 credit. Would that work?"]
+    s.wait_for_reply()
+    out = s.send("Could you tell me the expiry?", ask=lambda q, c: 1 / 0)
+    assert out["support_said"] == ["Dana: It expires in 30 days."]
+    assert s.open_offer() == "Dana: I can offer a $36 credit. Would that work?"
+    assert [f.kind for f in s.guard.commitments("Yes, go ahead")] == ["commitment"]
+    asked = []
+    out = s.send("Yes, go ahead", ask=lambda q, c: asked.append(q) or DECLINE_OFFER)
+    assert asked and "$36 credit" in asked[0] and "Yes, go ahead" not in page.sent
+
+
+# --- G8: accepting an offer covers that offer only, once ------------------------------------------
+
+def test_an_accepted_offer_does_not_cover_paying_for_something_else(tmp_path):
+    s, page, clock = session(tmp_path, {"take the credit": (3.0, "Done, the credit is on your account.")})
+    s.wait_for_reply()
+    page.lines += ["Dana", "I can offer a $36 store credit. Would that work?"]
+    s.wait_for_reply()
+    asked = []
+
+    def ask(q, choices):
+        asked.append(choices)
+        return ACCEPT_OFFER if ACCEPT_OFFER in choices else DENY
+
+    assert s.send("No thanks, not today.", ask=ask)["status"] == "user_accepts_offer"
+    extra = "Yes, and also upgrade me to premium for $99, cancel my old plan."
+    assert s.send(extra, intent="agree", ask=ask)["status"] == "user_declined"
+    assert extra not in page.sent and asked[-1] == [APPROVE, DENY, STOP]
+    out = s.send("Yes, I'll take the credit.", intent="agree", ask=ask)
+    assert out["sent"] == "Yes, I'll take the credit." and s.decided == {}
+    page.lines += ["Dana", "I can offer a $36 store credit. Would that work?"]  # the same words again, later
+    s.wait_for_reply()
+    before = len(asked)
+    s.send("Yes, please.", intent="agree", ask=lambda q, c: asked.append(c) or DECLINE_OFFER)
+    assert len(asked) == before + 1 and "Yes, please." not in page.sent
+
+
+def test_an_accepted_paid_offer_lets_its_own_payment_through(tmp_path):
+    s, page, clock = session(tmp_path, {"upgrade me": (3.0, "Done, you are on premium.")})
+    s.wait_for_reply()
+    page.lines += ["Dana", "I can upgrade you to premium for $10 a month. Would that work?"]
+    s.wait_for_reply()
+    ask = lambda q, c: ACCEPT_OFFER if ACCEPT_OFFER in c else 1 / 0
+    assert s.send("No thanks, not today.", ask=ask)["status"] == "user_accepts_offer"
+    out = s.send("Yes, please upgrade me.", intent="agree", ask=ask)
+    assert out["sent"] == "Yes, please upgrade me."
+
+
+# --- S1: a pending approval does not survive a restart ----------------------------------------
+
+def test_a_pending_approval_is_not_restored(tmp_path):
+    s, page = _offer_on_the_gate(tmp_path)
+    assert "pending" not in json.loads((tmp_path / "chat" / "session.json").read_text())
+    back = ChatSession.restore(tmp_path / "chat", page, clock=s._clock, sleep=s._sleep)
+    assert back.pending is None
+    out = back.send("Yes, I'll take the $36 partial refund.", intent="agree", ask=None)
+    assert out["status"] == "needs_user" and "Yes, I'll take the $36 partial refund." not in page.sent
+
+
+# --- S2: failures to type the hold or follow-up line are said, not swallowed --------------------
+
+class FailingPage(FakePage):
+    def __init__(self, *a, fail=(), **kw):
+        super().__init__(*a, **kw)
+        self.fail = set(fail)
+
+    def send(self, message):
+        if message in self.fail:
+            raise RuntimeError("composer gone")
+        super().send(message)
+
+
+def _failing_session(tmp_path, fail):
+    clock = Clock()
+    page = FailingPage(clock, {}, fail=fail)
+    s = ChatSession(page, "http://shop.test/help", "Full refund for order 1234", {"order number": "1234"}, [],
+                    tmp_path / "chat", clock=clock, sleep=clock.sleep)
+    s.wait_for_reply()
+    return s, page
+
+
+def test_a_hold_line_that_cannot_be_typed_is_noted_and_the_user_is_still_asked(tmp_path):
+    s, page = _failing_session(tmp_path, {HOLD})
+    asked = []
+    out = s.send("My email is sam@example.com", ask=lambda q, c: asked.append(q) or DENY)
+    assert asked and out["status"] == "user_declined"
+    assert any(t.who == "note" and "could not be told to hold on" in t.text for t in s.turns)
+
+
+def test_the_hold_line_is_never_typed_twice_in_a_row(tmp_path):
+    s, page, clock = session(tmp_path, {})
+    s.wait_for_reply()
+    s.send("My email is sam@example.com", ask=lambda q, c: DENY)
+    s.send("My phone is +1 415 555 0100", ask=lambda q, c: DENY)
+    assert page.sent == [HOLD]
+
+
+def test_a_follow_up_that_cannot_be_typed_is_not_claimed(tmp_path):
+    s, page = _failing_session(tmp_path, {FOLLOW_UP})
+    page.lines += ["Dana", "I can offer a 20% partial refund ($36). Would that work for you?"]
+    s.wait_for_reply()
+    assert s.before_approval("Yes, I'll take the $36 partial refund.", "agree")[0] == "ask"
+    s.approval_refused("Yes, I'll take the $36 partial refund.", "BLOCKED: Action timed out without user response.")
+    text = (tmp_path / "chat" / "transcript.md").read_text()
+    assert s.closed and "could not be told" in text and "Support was told" not in text
+
+
+# --- S3: only a timed-out approval counts as nobody answering ------------------------------------
+
+def test_a_hook_timeout_is_a_block_not_a_missing_answer(tmp_path):
+    s, page = _offer_on_the_gate(tmp_path)
+    outcome = s.approval_refused("Yes, I'll take the $36 partial refund.",
+                                 "pre_tool_call plugin callback timed out or is still running")
+    assert outcome == "blocked" and not s.closed and page.sent == [HOLD]
+
+
+def test_a_user_denial_is_declined(tmp_path):
+    s, page = _offer_on_the_gate(tmp_path)
+    assert s.approval_refused("Yes, I'll take the $36 partial refund.", "BLOCKED: User denied this action.") == "declined"
+
+
+# --- R2: an agent leaving is a hint, not the end -----------------------------------------------
+
+def test_an_agent_leaving_is_reported_with_a_hint(tmp_path):
+    s, page, clock = session(tmp_path, {})
+    s.wait_for_reply()
+    page.lines += ["Dana has left the chat."]
+    out = s.wait_for_reply()
+    assert out["status"] == "replied" and not s.ended
+    assert "support_chat_end" in out["hint"]
+    page.lines += ["Sam joined the chat.", "Sam", "Hi, I'm taking over from Dana."]
+    assert s.wait_for_reply()["status"] == "replied" and not s.ended
+
+
+def test_a_reply_that_needed_an_ok_asks_the_agent_to_report_it(tmp_path):
+    """Hermes's gate can answer yes with nobody asked (yolo), so the result itself says to report back."""
+    s, page, clock = session(tmp_path, {"Yes, please": (5.0, "Done! Refund RF-48213 is processed.")})
+    s.wait_for_reply()
+    page.lines += ["Dana", "I can do a full refund of $180. Shall I go ahead?"]
+    s.wait_for_reply()
+    s.before_approval("Yes, please go ahead.", "agree")
+    out = s.send("Yes, please go ahead.", intent="agree", ask=None)
+    assert "Yes, please go ahead." in out["tell_user"]

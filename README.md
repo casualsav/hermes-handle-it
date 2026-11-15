@@ -34,6 +34,7 @@ A model told to "go handle my support chat" will happily say yes to the first of
 
 - **The approval gate.** Every outgoing message is checked before it is typed. When support makes an offer and asks for a yes, the answer is yours, whichever way the model leans: you see the offer and the reply Hermes drafted, and accept or turn it down. Anything that pays, buys, cancels or authorises something is shown to you first too. *Silence accepts nothing*: no answer means nothing is sent. While you decide, Hermes tells the agent "One moment please, I'm checking with the account holder." Card numbers are never typed at all, even with a yes: paying is left to you.
 - **The shareable-details list.** You say what Hermes may share (`order number`, `name`, `email`…). Email addresses, phone numbers, account or card numbers and secrets (passwords, one-time codes) that are not on the list, not in your own words and not first said by support, need your OK. So does any answer to "can you confirm your …?" that contains none of the listed details. Values you mark `never_share` are caught verbatim.
+- **Real chat pages.** A cookie banner over the chat button is refused, never accepted (consenting to tracking is yours to give). A pre-chat form (name, email, topic) is filled only from your shareable details; when it asks for one you did not list, nothing is typed and Hermes asks you. A message that did not go out is reported as not sent.
 - **The waiting loop with no time cap.** Hermes polls the chat every second and counts a reply once support has been quiet for three seconds and is not typing, so a reply split over several bubbles arrives whole. A wait that runs out returns `still_waiting` and Hermes waits again: an hour on hold is just more waits. Every step is saved, so a chat survives the end of a turn or a restart of Hermes and carries on from its saved transcript, in the same browser profile so the chat widget finds its conversation again.
 - **Sign-in through Hermes, never through the plugin.** When the chat sits behind a login, Hermes signs in with its own vault (`browser_vault` fill and enter_code, on Hermes's browser) before the chat starts; the plugin never reads a password or a code. This needs Hermes's `browser.cdp_url`, so that the plugin opens the chat in that same browser and its sign-in.
 - **Public addresses only.** The chat browser resolves every page, every redirect hop and every frame before it loads, and refuses private, loopback, link-local and CGNAT addresses and cloud metadata endpoints (169.254.169.254 and the like), as Hermes's own browser policy does. Your Hermes opt-out (`security.allow_private_urls`) lifts the private-address floor only, never the metadata one.
@@ -72,6 +73,8 @@ Chats live in `$HERMES_HOME/hermes-handle-it/chats/<time>-<id>/`: `transcript.md
 
 A message that agrees, pays, cancels or shares a detail you did not allow goes through Hermes's approval gate (a `pre_tool_call` hook) on every surface, CLI and gateway (Telegram, Discord…) alike, so it arrives the way your approvals do, including any approval transport plugin you use. When the model turns an offer down, the tool asks you itself through Hermes's question prompt (the card above). If approvals are turned off, nothing that needs your OK is sent; Hermes tells you what support offered instead.
 
+Under Hermes's yolo mode (`--yolo`, or `/yolo` on a gateway) Hermes answers its own approval prompt with a yes and asks nobody. Handle It goes through Hermes, so there a reply that would have waited for you is sent, and a call is placed. Whenever such a reply goes out or a call is placed, the tool's result tells the agent to report to you what it just agreed to, shared or dialled.
+
 ### Browser
 
 Handle It runs its own Chromium through Playwright, with a profile in `$HERMES_HOME/hermes-handle-it/browser-profile`. It is headless by default; it shows its window when Hermes's `browser.headed` is set or `AGENT_BROWSER_HEADED=1`, which is how the demo shows it on a desktop. If Hermes's `browser.cdp_url` is set, it opens the chat in that browser, Hermes's own, instead: this is what a chat behind a sign-in needs, since the sign-in Hermes made there carries into the chat.
@@ -109,22 +112,23 @@ Recording (`record: true`) keeps bland.ai's recording of the call, and the agent
 
 ## What it has been tried on
 
-- **Tried:** the demo shop above, end to end in Hermes Agent 0.21.5 on Linux (arm64) with DeepSeek as the model, in the CLI; on a Telegram gateway (Hermes Agent 0.23.1), where each acceptance arrived as Hermes's approval card with its buttons: one approved and sent, one left unanswered that timed out with nothing sent; in tests, the chat inside the page, the same chat inside an iframe behind a "Chat with us" launcher (the shape of Intercom, Zendesk and similar widgets), a sign-in made in the browser at `browser.cdp_url` carrying into the chat, and redirects and frames into private and metadata addresses being stopped before they load. Unit tests cover the guard (including an offer stated without a question, and a reply that takes it without saying "agree"), the reader, the waiting loop, approvals and restart.
-- **Not tried yet:** a real company's live chat (it would mean talking to real people at a real company; real widgets add cookie banners, pre-chat forms, canvas and closed shadow DOM), macOS, a sign-in with `browser_vault` end to end in a Hermes session with a model, and chats that require a pre-chat form first (`support_chat_start` reports that it found no message box).
+- **Tried:** the demo shop above, end to end in Hermes Agent 0.21.5 on Linux (arm64) with DeepSeek as the model, in the CLI; on a Telegram gateway (Hermes Agent 0.23.1), where each acceptance arrived as Hermes's approval card with its buttons: one approved and sent, one left unanswered that timed out with nothing sent; in tests, the chat inside the page, the same chat inside an iframe behind a "Chat with us" launcher (the shape of Intercom, Zendesk and similar widgets), a cookie banner over that launcher, a pre-chat form before the message box, text inside open shadow roots, a sign-in made in the browser at `browser.cdp_url` carrying into the chat, and redirects and frames into private and metadata addresses being stopped before they load. Unit tests cover the guard (including an offer stated without a question, a reply that takes it without saying "agree", a yes that comes after a question back, and numbers written in other digit forms or in groups), the reader, the waiting loop, approvals and restart.
+- **Not tried yet:** a real company's live chat (it would mean talking to real people at a real company; real widgets add their own cookie banners and pre-chat forms, and some draw on canvas or in closed shadow DOM), macOS, a sign-in with `browser_vault` end to end in a Hermes session with a model, and a pre-chat form on a real widget.
 
-How it reads any chat: it compares the visible text of the page and all its frames between polls, so it needs no per-site code; it finds the message box by its role and label, and presses Enter or the Send button. Widgets that draw messages on a canvas or in closed shadow DOM would need more.
+How it reads any chat: it compares the visible text of the page, all its frames and their open shadow roots between polls, so it needs no per-site code; it finds the chat button by its name, the message box by its role and label, and presses Enter or the Send button. Widgets that draw messages on a canvas or in closed shadow DOM would need more.
 
 ## Design
 
 The conversation loop (`session.py`) talks to a *channel* with five methods: `text()`, `send()`, `find_composer()`, `screenshot()`, `close()`. The browser page (`browser.py`) is the one channel today; a phone channel through a calling plugin could implement the same five and reuse the loop, the guard and the approvals unchanged.
 
 ```
-__init__.py   register(): seven tools, the pre_tool_call approval hook, the post_tool_call hook that closes a chat on an unanswered card, on_session_finalize
+__init__.py   register(): seven tools, the pre_tool_call approval hooks, the post_tool_call hooks (an unanswered card closes the chat, a refused call is forgotten), on_session_finalize
 handlers.py   tool schemas and handlers, reaching the user (approval, progress)
 session.py    the loop: wait for replies, gate every message, save state, transcript
 guard.py      what needs the user's OK: details not allowed, commitments, card numbers
 reader.py     turning page text into "Dana: …" messages, typing and end-of-chat markers
-browser.py    Playwright on its own thread, persistent profile, chat box and launcher finding
+browser.py    Playwright on its own thread, persistent profile, chat box and launcher finding, cookie banners, pre-chat forms
+prechat.py    which shareable detail goes into which field of a pre-chat form
 netguard.py   which addresses the browser may open: every page, redirect hop and frame
 bland.py      bland.ai's call API: place, read, stop
 phone.py      a support call: its instructions, the approval bridge, transcript and check

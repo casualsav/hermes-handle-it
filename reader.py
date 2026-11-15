@@ -10,17 +10,34 @@ from __future__ import annotations
 
 import difflib
 import re
+import unicodedata
 
-TYPING = re.compile(r"\b(is typing|are typing|typing\s*(?:…|\.\.\.)|is writing|composing)\b", re.I)
-ENDED = re.compile(
-    r"(has left the chat|left the conversation|chat (?:has )?ended|conversation (?:has )?ended|"
-    r"chat (?:is |has been )?closed|ended the chat|session (?:has )?ended)",
+# The whole line is the indicator: "Dana is typing…", "typing...". A message that mentions writing is not.
+TYPING = re.compile(
+    r"(?:[\w .'’&-]{1,40}\s)?(?:is|are)\s+(?:typing|writing)(?:\s+a message)?\s*(?:…|\.\.\.)?|"
+    r"(?:typing|composing)\s*(?:…|\.\.\.)?",
     re.I,
 )
+TYPING_MAX = 60
+# An agent leaving is not the end: another may join. Only a closing said on a short line ends the chat.
+ENDED = re.compile(
+    r"\b(?:chat|conversation|session) (?:has (?:been )?|was |is (?:now )?)?(?:ended|closed)\b|"
+    r"\bended the (?:chat|conversation|session)\b",
+    re.I,
+)
+ENDED_MAX = 80
+LEFT = re.compile(r"\bleft the (?:chat|conversation)\b", re.I)
+JOINED = re.compile(r"\bjoined the (?:chat|conversation)\b", re.I)
 SYSTEM = re.compile(r"\b(joined|left) the (chat|conversation)\b", re.I)
 OWN_LABELS = {"you", "me", "customer", "visitor", "guest"}
 UI_WORDS = {"send", "submit", "sign in", "log in", "start chat", "chat", "close", "minimize", "attach"}
-TIMESTAMP = re.compile(r"^\s*(\d{1,2}:\d{2}(\s?[ap]m)?|just now|now|\d+\s?(s|sec|m|min|mins|h)\s?ago)\s*$", re.I)
+_TIME = r"(?:\d{1,2}:\d{2}(?::\d{2})?(?:\s?[ap]\.?m\.?)?|just now|now|\d+\s?(?:s|sec|m|min|mins|h)\s?ago)"
+TIMESTAMP = re.compile(rf"^\s*{_TIME}\s*$", re.I)
+RECEIPT = re.compile(rf"^\s*(?:seen|delivered|read|sent)(?:\s*[·•|,-]?\s*(?:at\s+)?{_TIME})?\s*$", re.I)
+_OWN_LABEL = re.compile(r"^(?:%s)\s*[:-]\s*" % "|".join(sorted(OWN_LABELS)), re.I)
+_LEAD_TIME = re.compile(rf"^\[?{_TIME}\]?\s*[-·|]?\s*", re.I)
+_TRAIL_TIME = re.compile(rf"\s*[-·|]?\s*\[?{_TIME}\]?$", re.I)
+_QUOTES = str.maketrans({"‘": "'", "’": "'", "‚": "'", "‛": "'", "“": '"', "”": '"', "„": '"', "‟": '"'})
 
 
 def lines_of(text: str) -> list[str]:
@@ -37,15 +54,30 @@ def appeared(before: list[str], after: list[str]) -> list[str]:
     return out
 
 
+def _plain(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text).translate(_QUOTES)
+    return " ".join(text.split()).lower()
+
+
 def _is_own(line: str, sent: list[str]) -> bool:
-    low = line.lower()
-    if low in OWN_LABELS:
+    """Our own message as the page shows it, maybe with "You:" or a time around it."""
+    if line.lower() in OWN_LABELS:
         return True
+    rest = _LEAD_TIME.sub("", line.strip(), count=1)
+    labelled = _OWN_LABEL.match(rest)
+    rest = _TRAIL_TIME.sub("", rest[labelled.end():] if labelled else rest, count=1)
+    low = _plain(rest)
+    if not low:
+        return bool(labelled)
     for message in sent:
-        m = message.lower()
+        m = _plain(message)
         if low == m or (len(low) >= 8 and low in m):
             return True
     return False
+
+
+def _is_typing(line: str) -> bool:
+    return len(line) <= TYPING_MAX and bool(TYPING.fullmatch(line.strip()))
 
 
 def _is_label(line: str) -> bool:
@@ -53,10 +85,10 @@ def _is_label(line: str) -> bool:
 
 
 def incoming(new_lines: list[str], sent: list[str]) -> list[str]:
-    """The support side's new messages: our own text, typing indicators and timestamps dropped,
-    a speaker label joined to the message under it ("Dana" + "Hi" -> "Dana: Hi")."""
-    kept = [ln for ln in new_lines if not _is_own(ln, sent) and not TYPING.search(ln) and not TIMESTAMP.match(ln)
-            and ln.lower() not in UI_WORDS]
+    """The support side's new messages: our own text, typing indicators, timestamps and delivery receipts
+    dropped, a speaker label joined to the message under it ("Dana" + "Hi" -> "Dana: Hi")."""
+    kept = [ln for ln in new_lines if not _is_own(ln, sent) and not _is_typing(ln) and not TIMESTAMP.match(ln)
+            and not RECEIPT.match(ln) and ln.lower() not in UI_WORDS]
     out: list[str] = []
     i = 0
     while i < len(kept):
@@ -71,8 +103,14 @@ def incoming(new_lines: list[str], sent: list[str]) -> list[str]:
 
 
 def typing_now(lines: list[str]) -> bool:
-    return any(TYPING.search(ln) for ln in lines)
+    return any(_is_typing(ln) for ln in lines)
 
 
 def ended(lines: list[str]) -> bool:
-    return any(ENDED.search(ln) for ln in lines)
+    return any(len(ln) <= ENDED_MAX and ENDED.search(ln) for ln in lines)
+
+
+def agent_left(lines: list[str]) -> bool:
+    """An agent left the chat and nobody joined after."""
+    left = [i for i, ln in enumerate(lines) if len(ln) <= ENDED_MAX and LEFT.search(ln)]
+    return bool(left) and not any(JOINED.search(ln) for ln in lines[left[-1] + 1:])

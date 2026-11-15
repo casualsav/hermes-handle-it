@@ -7,6 +7,8 @@
   const speed = Number(params.get("speed")) || 1;
   // ?login=1 puts the chat behind a sign-in (demo password: northwind-demo); ?login=2fa adds a code step.
   const login = params.get("login");
+  // ?prechat=1 asks for a name and email (and optionally the order number) before the chat starts.
+  const prechat = params.get("prechat");
   const AGENT = "Dana";
   const log = document.getElementById("log");
   const input = document.getElementById("input");
@@ -153,11 +155,40 @@
     await say("Hi, I'm " + AGENT + " from Northwind Outfitters support. How can I help today?", 1);
   }
 
+  function openChat() {
+    log.hidden = false;
+    document.getElementById("composer").hidden = false;
+    agentName.textContent = "Connecting you to an agent…";
+    connect();
+  }
+
+  function askAboutYou() {
+    const form = document.getElementById("prechat");
+    const err = document.getElementById("prechat-error");
+    log.hidden = true;
+    document.getElementById("composer").hidden = true;
+    agentName.textContent = "Start a chat";
+    form.hidden = false;
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const name = document.getElementById("pc-name").value.trim();
+      const email = document.getElementById("pc-email").value.trim();
+      if (!name || !/^\S+@\S+\.\S+$/.test(email)) {
+        err.textContent = "Please enter your name and email.";
+        return;
+      }
+      form.hidden = true;
+      add("system", "", "Chatting as " + name + ".");
+      openChat();
+    });
+  }
+
   // A sign-in lasts for the browser session (a cookie), as on a real site: a chat opened again in
   // the same browser, after signing in there, starts straight away.
   const signedIn = document.cookie.split("; ").includes("northwind_signed_in=1");
   if (!login || signedIn) {
-    connect();
+    if (prechat) askAboutYou();
+    else connect();
   } else {
     const form = document.getElementById("signin");
     const code = document.getElementById("code");
@@ -184,10 +215,8 @@
       }
       document.cookie = "northwind_signed_in=1; path=/; SameSite=Lax";
       form.hidden = true;
-      log.hidden = false;
-      document.getElementById("composer").hidden = false;
-      agentName.textContent = "Connecting you to an agent…";
-      connect();
+      if (prechat) askAboutYou();
+      else openChat();
     });
   }
 })();

@@ -159,3 +159,82 @@ def test_a_sign_in_made_in_hermess_browser_carries_into_the_chat(shop, tmp_path,
     assert any("How can I help" in line for line in out["support_said"]), out
     assert "northwind-demo" not in raw
     handlers.end({"session_id": out["session_id"], "outcome": "test", "resolved": False}, parent_agent=Agent())
+
+
+# The browser on its own, against widget shapes real sites use.
+
+ENTER_DOES_NOT_SEND = '<!doctype html><title>Chat</title><textarea aria-label="Type your message"></textarea>'
+
+SHADOW = """<!doctype html><title>Chat</title><p>Light text</p><div id="host"></div>
+<script>
+  const root = document.getElementById("host").attachShadow({mode: "open"});
+  root.innerHTML = "<style>p { color: teal; }</style><p>Shadow hello</p><div id='inner'></div>";
+  root.getElementById("inner").attachShadow({mode: "open"}).innerHTML = "<p>Nested hello</p>";
+  document.body.appendChild(document.createElement("div")).attachShadow({mode: "closed"}).innerHTML = "<p>Closed text</p>";
+</script>"""
+
+
+@pytest.fixture()
+def chat_browser(tmp_path, monkeypatch):
+    """The plugin's browser. The pages are on 127.0.0.1, so Hermes's opt-out is on, as for the demo."""
+    monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "1")
+    b = browser.Browser(tmp_path / "profile")
+    yield b
+    b.shutdown()
+
+
+@pytest.fixture()
+def pages(tmp_path):
+    """Small test-only pages, served like the shop."""
+    root = tmp_path / "pages"
+    root.mkdir()
+    (root / "enter-does-not-send.html").write_text(ENTER_DOES_NOT_SEND, encoding="utf-8")
+    (root / "shadow.html").write_text(SHADOW, encoding="utf-8")
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(root))
+    handler.log_message = lambda *a: None
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{httpd.server_address[1]}/"
+    httpd.shutdown()
+
+
+def _open(b, url):
+    try:
+        return b.open(url)
+    except browser.BrowserUnavailable as exc:
+        pytest.skip(str(exc))
+
+
+@pytest.mark.parametrize("page", ["?prechat=1&speed=0.15", "widget.html?prechat=1&speed=0.15"], ids=["page", "iframe-widget"])
+def test_a_pre_chat_form_is_filled_before_the_chat_starts(shop, chat_browser, page):
+    chat = _open(chat_browser, shop + page)
+    assert chat.find_composer(open_chat=True, wait_s=6) is False  # the form's Name field is not the message box
+    fields = chat.prechat_fields()
+    assert [(f["label"], f["type"], f["required"], f["options"]) for f in fields] == [
+        ("Name", "text", True, []), ("Email", "email", True, []), ("Order number", "text", False, [])]
+    assert chat.fill_prechat({"Name": "Sam Rivera", "Email": "sam@example.com"}) is True
+    assert chat.find_composer(open_chat=False, wait_s=10) is True
+    assert chat.prechat_fields() == []
+    chat.send("Hi, my jacket's zipper broke.")
+    text = chat.text()
+    assert "Chatting as Sam Rivera." in text and "Hi, my jacket's zipper broke." in text
+
+
+def test_a_cookie_banner_over_the_launcher_is_refused_never_accepted(shop, chat_browser):
+    chat = _open(chat_browser, shop + "widget.html?cookies=1&speed=0.15")
+    assert chat.find_composer(open_chat=True, wait_s=20) is True
+    text = chat.text()
+    assert "Cookie choice: rejected." in text and "Cookie choice: accepted." not in text
+
+
+def test_a_message_that_did_not_go_out_is_not_reported_sent(pages, chat_browser):
+    chat = _open(chat_browser, pages + "enter-does-not-send.html")
+    assert chat.find_composer(open_chat=False, wait_s=5) is True
+    with pytest.raises(RuntimeError, match="did not send"):
+        chat.send("Hello?")
+
+
+def test_text_in_open_shadow_roots_is_read(pages, chat_browser):
+    text = _open(chat_browser, pages + "shadow.html").text()
+    assert text.index("Light text") < text.index("Shadow hello") < text.index("Nested hello")
+    assert text.count("Shadow hello") == 1 and "Closed text" not in text and "teal" not in text
